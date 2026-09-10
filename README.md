@@ -18,7 +18,7 @@ redundant. The image budget is therefore spent on tiles, not on Z.
 
 ## Flatfield Examples
 We estimate the flatfields by smartly selecting slices from each tile in the dataset.
-![Flatfield and raw data](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/flatifeld_estimation_raw_data.png?raw=true)
+![Flatfield and raw data](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/flatfield_estimation_raw_data.png?raw=true)
 
 This is the result after applying flatfield to the tiles of a proteomics dataset.
 ![Example Flatfield](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/flatfield_corrected.png?raw=true)
