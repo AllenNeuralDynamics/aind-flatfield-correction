@@ -17,14 +17,21 @@ readme = "README.md"
 version = "1.0.0"
 
 dependencies = [
-    "numpy",
-    "dask",
+    "numpy==1.24.2",
+    "dask[distributed]",
     "boto3",
+    "s3fs",
     "scikit-image",
     "matplotlib",
-    "basicpy",
     "tifffile",
     "psutil",
+    "BaSiCPy==1.1.0",
+    "jax==0.4.23",
+    "jaxlib==0.4.23",
+    "zarr==2.18.2",
+    "natsort==8.4.0",
+    "hyperactive==4.6.0",
+    "gradient-free-optimizers<1.9.0",
 ]
 
 [dependency-groups]
