@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aind-flatfield-correction"
-description = "Generated from aind-library-template"
+description = "Package for flatfield correction in microscopic images"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
@@ -14,9 +14,17 @@ classifiers = [
     "Programming Language :: Python :: 3"
 ]
 readme = "README.md"
-version = "0.0.0"
+version = "1.0.0"
 
 dependencies = [
+    "numpy",
+    "dask",
+    "boto3",
+    "scikit-image",
+    "matplotlib",
+    "basicpy",
+    "tifffile",
+    "psutil",
 ]
 
 [dependency-groups]
