@@ -1,0 +1,1 @@
+"""Core flatfield correction implementations."""

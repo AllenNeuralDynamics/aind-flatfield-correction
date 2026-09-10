@@ -1,0 +1,1 @@
+"""BaSiC-based flatfield estimation."""

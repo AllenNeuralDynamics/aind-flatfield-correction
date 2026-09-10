@@ -1,0 +1,634 @@
+"""
+Estimate flatfields using BaSiC.
+
+One run fits one multiplicative flatfield from a bounded number of Z
+planes taken from every tile under ``base_path``.  The sensor camera
+offset is removed before fitting, the ``smoothness_flatfield`` parameter
+is chosen by a two-stage search anchored on known-good manual
+parameters, and the result is checked for plausibility before it is
+written.
+
+``base_path`` is one channel's folder: nothing is inferred from the tile
+names, so to estimate several channels the command is run once per
+channel folder.  ``--tile-pattern`` optionally narrows the run to a
+subset of the tiles inside that folder.
+
+Examples
+--------
+Estimate one channel of a public SmartSPIM dataset::
+
+    python -m aind_flatfield_correction.core.basicpy.estimate \\
+        s3://aind-open-data/HCR_800792_2026-03-25_13-00-00/SPIM/ch_405 \\
+        --pyramid-level 3 \\
+        --darkfield-value 90 \\
+        --output-folder /results/flatfields
+
+Fit a subset of a flat tile folder, fitting every Z plane independently
+and combining by pixelwise median, and write the inspection figures::
+
+    python -m aind_flatfield_correction.core.basicpy.estimate <base_path> \\
+        --tile-pattern '_ch_405\\.ome\\.zarr$' --output-name ch405 \\
+        --method per-z-median --validate --output-folder ./flatfields
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any, NamedTuple
+
+import numpy as np
+
+from aind_flatfield_correction.core.basicpy.config import (
+    BASIC_CONFIG,
+    MANUAL_PARAMS,
+)
+from aind_flatfield_correction.core.basicpy.figures import (
+    save_validation_figures,
+)
+from aind_flatfield_correction.core.basicpy.fit import (
+    estimate_joint,
+    estimate_per_z_median,
+    report_flatfield,
+)
+from aind_flatfield_correction.core.basicpy.search import (
+    confirm_against_baseline,
+    parallel_autotune,
+)
+from aind_flatfield_correction.core.basicpy.tiles import (
+    FitStack,
+    list_tiles,
+    load_darkfield,
+    load_fit_stack,
+    match_darkfield,
+    subtract_pedestal,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class FitResult(NamedTuple):
+    """
+    Outcome of the final fit, after the plausibility guard.
+    Attributes
+    ----------
+    flatfield : np.ndarray
+        The estimated multiplicative flatfield.
+    darkfield : np.ndarray
+        The estimated additive darkfield (camera offset).
+    n_z_fits_ok : int or None
+        Number of successful per-Z fits (None for the joint method).
+    params : dict[str, float]
+        The parameters used for the final fit.
+    ok : bool
+        Whether the fit passed the plausibility check.
+    stats : dict[str, float]
+        Summary statistics of the fit.
+    reasons : list[str]
+        Reasons for any plausibility check failures.
+    """
+
+    flatfield: np.ndarray
+    darkfield: np.ndarray
+    n_z_fits_ok: int | None
+    params: dict[str, float]
+    ok: bool
+    stats: dict[str, float]
+    reasons: list[str]
+
+
+def select_parameters(
+    fit_slices: np.ndarray,
+    z_offsets: dict[int, tuple[int, int]],
+    args: argparse.Namespace,
+) -> tuple[dict[str, float], dict[str, Any], dict[str, Any] | None]:
+    """
+    Choose ``smoothness_flatfield`` for the final fit.
+
+    Parameters
+    ----------
+    fit_slices : np.ndarray
+        Pedestal-subtracted ``(N, H, W)`` fitting stack.
+    z_offsets : dict
+        Per-tile spans into ``fit_slices``.
+    args : argparse.Namespace
+        Parsed command-line arguments.
+
+    Returns
+    -------
+    tuple of (dict, dict, dict or None)
+        The chosen parameters, the search report, and the confirmation
+        report (None when no confirmation ran).
+    """
+    if args.skip_search:
+        logger.info("  Using manual params: %s", MANUAL_PARAMS)
+        return (
+            dict(MANUAL_PARAMS),
+            {"reason": "skip_search_flag", "chose_baseline": True},
+            None,
+        )
+
+    # Parallel autotune, faster than basicpy serial search
+    params, report = parallel_autotune(
+        images=fit_slices,
+        base_config=BASIC_CONFIG,
+        tile_z_offsets=z_offsets,
+        max_eval_slices=args.max_eval_slices,
+        max_search_minutes=args.max_search_minutes,
+    )
+    # A winner found on a small subset must hold up nearer final scale.
+    if not report.get("chose_baseline") and args.n_confirm > 0:
+        params, confirm = confirm_against_baseline(
+            fit_slices,
+            BASIC_CONFIG,
+            params,
+            tile_z_offsets=z_offsets,
+            n_confirm=args.n_confirm,
+        )
+        return params, report, confirm
+    return params, report, None
+
+
+def _run_fit(
+    fit_slices: np.ndarray,
+    stack: FitStack,
+    method: str,
+    fit_config: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, int | None]:
+    """
+    Dispatch to the requested estimation method.
+
+    Parameters
+    ----------
+    fit_slices : np.ndarray
+        Pedestal-subtracted fitting stack.
+    stack : FitStack
+        Per-tile spans and plane count, needed by the per-Z method.
+    method : str
+        Either ``"fit"`` or ``"per-z-median"``.
+    fit_config : dict
+        Full BaSiC keyword arguments.
+
+    Returns
+    -------
+    tuple of (np.ndarray, np.ndarray, int or None)
+        The flatfield, the darkfield, and the number of successful per-Z
+        fits (None for the joint method).
+    """
+    # We only have two methods, we can add more
+    # per-z-median is an approximation, runs faster but could be
+    # less accurate than the joint fit.
+    if method == "per-z-median":
+        return estimate_per_z_median(
+            fit_slices, stack.z_offsets, stack.n_planes, fit_config
+        )
+    return estimate_joint(fit_slices, fit_config)
+
+
+def fit_with_guard(
+    fit_slices: np.ndarray,
+    stack: FitStack,
+    method: str,
+    params: dict[str, float],
+    baseline_std: float | None,
+) -> FitResult:
+    """
+    Run the final fit and fall back to manual params if it looks wrong.
+
+    Parameters
+    ----------
+    fit_slices : np.ndarray
+        Pedestal-subtracted fitting stack.
+    stack : FitStack
+        Per-tile spans and plane count.
+    method : str
+        Either ``"fit"`` or ``"per-z-median"``.
+    params : dict
+        Parameters chosen by the search.
+    baseline_std : float or None
+        Standard deviation of the baseline fit, for the relative floor.
+
+    Returns
+    -------
+    FitResult
+        The flatfield actually accepted, the parameters that produced it,
+        and the guard's verdict.
+    """
+    started = time.monotonic()
+    flatfield, darkfield, n_z_ok = _run_fit(
+        fit_slices, stack, method, {**BASIC_CONFIG, **params}
+    )
+    logger.info("  Fit took %.1f min", (time.monotonic() - started) / 60.0)
+    ok, stats, reasons = report_flatfield(flatfield, baseline_std)
+
+    if not ok and params != dict(MANUAL_PARAMS):
+        logger.warning(
+            "  Refitting with manual params after the failed "
+            "plausibility check"
+        )
+        params = dict(MANUAL_PARAMS)
+        flatfield, darkfield, n_z_ok = _run_fit(
+            fit_slices, stack, method, {**BASIC_CONFIG, **MANUAL_PARAMS}
+        )
+        ok, stats, reasons = report_flatfield(
+            flatfield, None, "(manual refit)"
+        )
+    if not ok:
+        logger.warning(
+            "  !! flatfield still suspicious after the fallback - "
+            "recording it as suspicious"
+        )
+    return FitResult(flatfield, darkfield, n_z_ok, params, ok, stats, reasons)
+
+
+def _write_products(
+    label: str,
+    output_folder: Path,
+    result: FitResult,
+    dark_plane: np.ndarray,
+    stack: FitStack,
+    tile_names: list[str],
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """
+    Save the fitted arrays and, when asked for, the figures.
+
+    The saved darkfield is the pedestal actually subtracted before
+    fitting, not BaSiC's own darkfield estimate: ``get_darkfield`` is
+    off, so that estimate is all zeros and the pedestal is what an apply
+    step needs.
+
+    Parameters
+    ----------
+    label : str
+        Name used for the output files and figures.
+    output_folder : Path
+        Folder to write into.
+    result : FitResult
+        The accepted fit.
+    dark_plane : np.ndarray
+        Darkfield plane subtracted before fitting.
+    stack : FitStack
+        Planes the fit was built from, needed by the figures.
+    tile_names : list of str
+        Tiles that contributed to the fit, in stack order.
+    args : argparse.Namespace
+        Parsed command-line arguments.
+
+    Returns
+    -------
+    dict or None
+        The validation metrics, or None when ``--validate`` was not
+        passed.
+    """
+    np.save(output_folder / f"flatfield_{label}.npy", result.flatfield)
+    np.save(output_folder / f"darkfield_{label}.npy", dark_plane)
+    if not args.validate:
+        return None
+    return save_validation_figures(
+        label,
+        result.flatfield,
+        dark_plane,
+        stack,
+        tile_names,
+        output_folder / label,
+        args.pyramid_level,
+        args.validate_tiles,
+    )
+
+
+def estimate_dataset(
+    label: str,
+    tile_names: list[str],
+    dark: np.ndarray | float,
+    args: argparse.Namespace,
+    output_folder: Path,
+) -> dict[str, Any]:
+    """
+    Estimate and save one flatfield from a folder of tiles.
+
+    Parameters
+    ----------
+    label : str
+        Name used for the output files and figure titles.
+    tile_names : list of str
+        Every tile to fit, all from the same channel folder.
+    dark : np.ndarray or float
+        Darkfield image or scalar pedestal.
+    args : argparse.Namespace
+        Parsed command-line arguments.
+    output_folder : Path
+        Folder the flatfield, darkfield and sidecar are written to.
+
+    Returns
+    -------
+    dict
+        The sidecar metadata written alongside the flatfield.
+    """
+    logger.info("%s", "=" * 60)
+    logger.info("  %s (%d tiles)", label, len(tile_names))
+    logger.info("%s", "=" * 60)
+
+    # Loads the data from the tiles
+    stack = load_fit_stack(
+        args.base_path, tile_names, args.pyramid_level, args.max_fit_planes
+    )
+    # Matches the darkfield with the dimension of the stack
+    dark_plane = match_darkfield(dark, (stack.height, stack.width))
+    # Subtract the darkfield from the stack slices to estimate the flat
+    fit_slices, pedestal = subtract_pedestal(stack.slices, dark_plane)
+
+    params, search_report, confirm = select_parameters(
+        fit_slices, stack.z_offsets, args
+    )
+    result = fit_with_guard(
+        fit_slices,
+        stack,
+        args.method,
+        params,
+        (search_report or {}).get("baseline_std"),
+    )
+
+    validation = _write_products(
+        label, output_folder, result, dark_plane, stack, tile_names, args
+    )
+
+    sidecar = {
+        "label": label,
+        "base_path": args.base_path,
+        "tile_pattern": args.tile_pattern,
+        "params": result.params,
+        "basic_config": BASIC_CONFIG,
+        "method": args.method,
+        "search": search_report,
+        "confirm": confirm,
+        "flatfield_stats": result.stats,
+        "guard": {"ok": bool(result.ok), "reasons": result.reasons},
+        "suspicious": (not result.ok),
+        "n_tiles": len(tile_names),
+        "planes_per_tile": int(stack.n_planes),
+        "n_fit_images": int(fit_slices.shape[0]),
+        "pyramid_level": args.pyramid_level,
+        "darkfield_image": args.darkfield_image,
+        "darkfield_value": (
+            None if args.darkfield_image else float(args.darkfield_value)
+        ),
+        "darkfield_mean": float(dark_plane.mean()),
+        "pedestal": pedestal,
+        "n_z_fits_ok": result.n_z_fits_ok,
+        "validation": validation,
+        # The only record of which tiles produced this flatfield: the
+        # names are not recoverable from anything else.
+        "tiles": tile_names,
+    }
+    sidecar_path = output_folder / f"flatfield_{label}.json"
+    with open(sidecar_path, "w") as handle:
+        json.dump(sidecar, handle, indent=2, default=str)
+    logger.info(
+        "  Saved flatfield_%s.npy, darkfield_%s.npy and " "flatfield_%s.json",
+        label,
+        label,
+        label,
+    )
+    return sidecar
+
+
+def default_label(base_path: str) -> str:
+    """
+    Derive an output name from the channel folder's own name.
+
+    Parameters
+    ----------
+    base_path : str
+        Channel folder, ``s3://`` or local.
+
+    Returns
+    -------
+    str
+        The last non-empty path segment, with anything but letters,
+        digits, dot, dash and underscore replaced by an underscore.
+        Falls back to ``"flatfield"`` for a path with no usable
+        segment.
+    """
+    segments = [
+        segment
+        for segment in base_path.replace("s3://", "").split("/")
+        if segment
+    ]
+    if not segments:
+        return "flatfield"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", segments[-1]).strip("_")
+
+
+def _add_data_arguments(parser: argparse.ArgumentParser) -> None:
+    """
+    Add the input, darkfield and output arguments.
+
+    Parameters
+    ----------
+    parser : argparse.ArgumentParser
+        Parser to extend.
+
+    Returns
+    -------
+    None
+    """
+    parser.add_argument(
+        "base_path",
+        type=str,
+        help="Folder holding one channel's tiles. Accepts s3 input. "
+        "Every OME-Zarr inside it is fitted together, so run the "
+        "command once per channel folder.",
+    )
+    parser.add_argument(
+        "--tile-pattern",
+        type=str,
+        default=None,
+        help="Regular expression used to keep only the tiles whose name "
+        r"matches it, e.g. '_ch_405\.ome\.zarr$'. Default: every entry "
+        "in the folder, which must then hold only tiles.",
+    )
+    parser.add_argument(
+        "--output-name",
+        type=str,
+        default=None,
+        help="Name used for the output files and figures. Defaults to "
+        "the last segment of base_path, e.g. 'ch_405'.",
+    )
+    parser.add_argument(
+        "--pyramid-level",
+        type=int,
+        default=3,
+        help="Pyramid level to use for the estimation (default 3).",
+    )
+    parser.add_argument(
+        "--darkfield-image",
+        type=str,
+        default=None,
+        help="Darkfield image (.npy) to use for the estimation.",
+    )
+    parser.add_argument(
+        "--darkfield-value",
+        type=float,
+        default=0.0,
+        help="Darkfield value to use for the estimation. "
+        "This is ignored if darkfield-image is provided.",
+    )
+    parser.add_argument(
+        "--output-folder",
+        type=str,
+        default="flatfield_estimation",
+        help="Folder to save the output flatfield estimations.",
+    )
+
+
+def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
+    """
+    Add the estimation-method and validation arguments.
+
+    Parameters
+    ----------
+    parser : argparse.ArgumentParser
+        Parser to extend.
+
+    Returns
+    -------
+    None
+    """
+    parser.add_argument(
+        "--method",
+        choices=["fit", "per-z-median"],
+        default="fit",
+        help="fit (default): one joint BaSiC fit over all tiles x a "
+        "bounded number of Z planes each.  per-z-median: one fit per Z "
+        "index across all tiles, combined with a pixelwise median.",
+    )
+    parser.add_argument(
+        "--max-fit-planes",
+        type=int,
+        default=2000,
+        help="Image budget for the joint fit (default 2000). "
+        "Planes per tile = budget // n_tiles, taken from the middle "
+        "60%% of Z.",
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Emit X/Y intensity-profile plots for a few representative "
+        "tiles so each flatfield can be inspected and accepted before "
+        "use.",
+    )
+    parser.add_argument(
+        "--validate-tiles",
+        type=int,
+        default=4,
+        help="Number of tiles to plot profiles for when --validate is "
+        "set (default 4, spread across the mosaic).",
+    )
+
+
+def _add_search_arguments(parser: argparse.ArgumentParser) -> None:
+    """
+    Add the parameter-search arguments.
+
+    Parameters
+    ----------
+    parser : argparse.ArgumentParser
+        Parser to extend.
+
+    Returns
+    -------
+    None
+    """
+    parser.add_argument(
+        "--skip-search",
+        action="store_true",
+        help="Skip the parameter search and use the known-good manual "
+        "params.",
+    )
+    parser.add_argument(
+        "--max-eval-slices",
+        type=int,
+        default=150,
+        help="Slices used to score each search candidate (default 150).",
+    )
+    parser.add_argument(
+        "--n-confirm",
+        type=int,
+        default=1500,
+        help="Slices for the confirmation refit (default 1500; 0 "
+        "disables).",
+    )
+    parser.add_argument(
+        "--max-search-minutes",
+        type=float,
+        default=120.0,
+        help="Abort the search and use manual params if projected to "
+        "exceed this.",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """
+    Build the command-line parser.
+
+    Returns
+    -------
+    argparse.ArgumentParser
+        Parser for the estimation entry point.
+    """
+    parser = argparse.ArgumentParser(description="BaSiC flatfield estimation.")
+    _add_data_arguments(parser)
+    _add_fit_arguments(parser)
+    _add_search_arguments(parser)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """
+    Main function for BaSiC flatfield estimation.
+
+    Parameters
+    ----------
+    argv : list of str, optional
+        Command-line arguments to parse. If None, uses sys.argv.
+
+    Returns
+    -------
+    None
+    """
+    args = build_parser().parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    logger.info("Starting BaSiC flatfield estimation with arguments: %s", args)
+
+    # Keep JAX on CPU here and in every spawned worker.
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+    output_folder = Path(args.output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    pattern = re.compile(args.tile_pattern) if args.tile_pattern else None
+    tile_names = list_tiles(args.base_path, pattern)
+    label = args.output_name or default_label(args.base_path)
+    logger.info("Found %d tiles | output name: %s", len(tile_names), label)
+
+    dark = load_darkfield(args.darkfield_image, args.darkfield_value)
+    estimate_dataset(label, tile_names, dark, args, output_folder)
+
+    logger.info(
+        "Ending BaSiC flatfield estimation with outputs at: %s",
+        output_folder,
+    )
+
+
+if __name__ == "__main__":
+    main()
