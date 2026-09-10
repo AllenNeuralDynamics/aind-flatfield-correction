@@ -22,13 +22,34 @@ from tifffile import imread as tif_imread
 
 logger = logging.getLogger(__name__)
 
+# OME-NGFF orders its multiscale datasets from highest to lowest
+# resolution, so the first one is the full-resolution level.
+FULL_RESOLUTION_LEVEL = "0"
+
+
+class TileRecord(NamedTuple):
+    """
+    What one tile contributed to the fit.
+
+    Kept so that a finished run can say exactly which planes it was
+    built from, and so that a dead tile (``mean`` near zero) or a tile
+    smaller than the rest (``padded``) is visible after the fact.
+    """
+
+    name: str
+    shape: tuple[int, ...]
+    z_indices: tuple[int, ...]
+    mean: float
+    padded: bool
+
 
 class FitStack(NamedTuple):
     """
     Raw planes gathered from every tile of one channel.
 
     ``z_offsets`` maps a tile's index in the tile-name list to its
-    ``(start, end)`` span in ``slices``.
+    ``(start, end)`` span in ``slices``; ``manifest`` holds one
+    :class:`TileRecord` per tile, in the same order.
     """
 
     slices: np.ndarray
@@ -36,6 +57,7 @@ class FitStack(NamedTuple):
     n_planes: int
     height: int
     width: int
+    manifest: tuple[TileRecord, ...] = ()
 
 
 def _list_tile_names_s3(base_path: str) -> list[str]:
@@ -273,7 +295,8 @@ def load_fit_stack(
     -------
     FitStack
         The loaded planes, per-tile spans into them, the planes taken
-        per tile, and the padded plane height and width.
+        per tile, the padded plane height and width, and one
+        :class:`TileRecord` per tile.
     """
     logger.info("  Probing tile shapes at level %s", level)
     shapes = probe_tile_shapes(base_path, tiles, level)
@@ -302,6 +325,7 @@ def load_fit_stack(
     # grid would need real stage positions: read them from the
     # acquisition.json metadata rather than inferring them from tile names.
     z_offsets: dict[int, tuple[int, int]] = {}
+    manifest: list[TileRecord] = []
 
     offset = 0
     for index, tile in enumerate(tiles):
@@ -313,6 +337,15 @@ def load_fit_stack(
         end = offset + n_z
         stack[offset:end, :plane_h, :plane_w] = vol
         z_offsets[index] = (offset, end)
+        manifest.append(
+            TileRecord(
+                name=tile,
+                shape=shapes[tile],
+                z_indices=tuple(int(z) for z in z_idx),
+                mean=float(vol.mean()),
+                padded=(plane_h, plane_w) != (max_h, max_w),
+            )
+        )
         offset = end
         del vol
         if (index + 1) % 10 == 0 or index + 1 == len(tiles):
@@ -325,7 +358,7 @@ def load_fit_stack(
         float(stack.min()),
         float(stack.max()),
     )
-    return FitStack(stack, z_offsets, n_planes, max_h, max_w)
+    return FitStack(stack, z_offsets, n_planes, max_h, max_w, tuple(manifest))
 
 
 def load_darkfield(
@@ -388,6 +421,74 @@ def load_darkfield(
     return float(darkfield_value)
 
 
+def resize_plane(plane: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """
+    Resample a 2-D plane onto ``shape``.
+
+    Bilinear with edge padding and no anti-aliasing, matching how the
+    correction is applied: these fields are smooth by construction, so
+    interpolating them is exact enough, and anti-aliasing would only
+    blur an already smooth surface.  ``preserve_range`` keeps the
+    values in gain units instead of rescaling them to [0, 1].
+
+    Parameters
+    ----------
+    plane : np.ndarray
+        Source ``(H, W)`` plane.
+    shape : tuple of int
+        Target ``(height, width)``.
+
+    Returns
+    -------
+    np.ndarray
+        The resampled plane, float32. The input is returned unchanged
+        when it is already the requested shape.
+    """
+    plane = np.asarray(plane, dtype=np.float32)
+    if plane.shape == tuple(shape):
+        return plane
+    resized = sk_resize(
+        plane,
+        shape,
+        order=1,
+        mode="edge",
+        anti_aliasing=False,
+        preserve_range=True,
+    )
+    return np.asarray(resized, dtype=np.float32)
+
+
+def probe_plane_shape(
+    base_path: str,
+    tile_name: str,
+    level: int | str = FULL_RESOLUTION_LEVEL,
+) -> tuple[int, int]:
+    """
+    Read one tile's plane extent at ``level`` from its metadata.
+
+    Only the array's shape is touched, so this costs a metadata read
+    and fetches no voxels. 
+
+    Parameters
+    ----------
+    base_path : str
+        Dataset path holding the tile.
+    tile_name : str
+        Tile whose extent stands for the channel's.
+    level : int or str, optional
+        Multiscale level to read, by default the highest-resolution
+        level.
+
+    Returns
+    -------
+    tuple of int
+        The ``(height, width)`` of a plane at that level.
+    """
+    arr = open_tile(base_path, tile_name, level)
+    height, width = arr.shape[-2], arr.shape[-1]
+    return int(height), int(width)
+
+
 def match_darkfield(
     dark: np.ndarray | float, shape: tuple[int, int]
 ) -> np.ndarray:
@@ -417,15 +518,7 @@ def match_darkfield(
             dark.shape,
             tuple(shape),
         )
-        dark = sk_resize(
-            dark,
-            shape,
-            order=1,
-            mode="edge",
-            anti_aliasing=False,
-            preserve_range=True,
-        )
-    return np.asarray(dark, dtype=np.float32)
+    return resize_plane(dark, shape)
 
 
 def subtract_pedestal(

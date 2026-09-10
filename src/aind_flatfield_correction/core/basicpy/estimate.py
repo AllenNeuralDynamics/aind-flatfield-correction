@@ -3,10 +3,7 @@ Estimate flatfields using BaSiC.
 
 One run fits one multiplicative flatfield from a bounded number of Z
 planes taken from every tile under ``base_path``.  The sensor camera
-offset is removed before fitting, the ``smoothness_flatfield`` parameter
-is chosen by a two-stage search anchored on known-good manual
-parameters, and the result is checked for plausibility before it is
-written.
+offset is removed before fitting.
 
 ``base_path`` is one channel's folder: nothing is inferred from the tile
 names, so to estimate several channels the command is run once per
@@ -79,16 +76,28 @@ from aind_flatfield_correction.core.basicpy.search import (
     parallel_autotune,
 )
 from aind_flatfield_correction.core.basicpy.tiles import (
+    FULL_RESOLUTION_LEVEL,
     FitStack,
     list_tiles,
     load_darkfield,
     load_fit_stack,
     match_darkfield,
+    probe_plane_shape,
+    resize_plane,
     subtract_pedestal,
+)
+from aind_flatfield_correction.provenance import (
+    attach_run_log,
+    detach_run_log,
+    gather_provenance,
+    utc_now,
 )
 
 logger = logging.getLogger(__name__)
 
+METADATA_DIR = "metadata"
+
+RUN_LOG_NAME = "estimation.log"
 
 class FitResult(NamedTuple):
     """
@@ -272,6 +281,148 @@ def fit_with_guard(
         )
     return FitResult(flatfield, darkfield, n_z_ok, params, ok, stats, reasons)
 
+def write_tile_manifest(
+    label: str, output_folder: Path, stack: FitStack
+) -> str:
+    """
+    Write one record per tile that contributed to the fit.
+
+    A separate file rather than a sidecar key: it is one entry per tile,
+    which for a full channel would bury the parts of the sidecar a
+    person actually reads.
+
+    Parameters
+    ----------
+    label : str
+        Name used for the output file.
+    output_folder : Path
+        Run's output folder; the metadata subfolder is created here.
+    stack : FitStack
+        The loaded stack, carrying its per-tile manifest.
+
+    Returns
+    -------
+    str
+        The manifest's path relative to ``output_folder``.
+    """
+    folder = output_folder / METADATA_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    relative = f"{METADATA_DIR}/tiles_{label}.json"
+    records = [record._asdict() for record in stack.manifest]
+    with open(output_folder / relative, "w") as handle:
+        json.dump(records, handle, indent=2, default=str)
+    logger.info("  Tile manifest: %d tiles -> %s", len(records), relative)
+    return relative
+
+
+def summarize_stack(
+    stack: FitStack, n_fit_images: int, pedestal: dict[str, float]
+) -> dict[str, Any]:
+    """
+    Summarize the stack the fit was built from.
+
+    The median is taken from the pedestal report rather than recomputed:
+    ``subtract_pedestal`` has already paid for it, and a second pass
+    over a stack this size costs seconds and a large temporary.
+
+    Parameters
+    ----------
+    stack : FitStack
+        The loaded stack.
+    n_fit_images : int
+        Planes actually handed to the solver.
+    pedestal : dict
+        The report from ``subtract_pedestal``.
+
+    Returns
+    -------
+    dict
+        Extent, plane counts, intensity range and how many tiles were
+        zero-padded into the stack.
+    """
+    return {
+        "height": int(stack.height),
+        "width": int(stack.width),
+        "planes_per_tile": int(stack.n_planes),
+        "n_images": int(n_fit_images),
+        "min": float(stack.slices.min()),
+        "max": float(stack.slices.max()),
+        "median": pedestal["median_raw"],
+        "n_padded_tiles": sum(1 for record in stack.manifest if record.padded),
+    }
+
+
+def upsample_to_full_resolution(
+    label: str,
+    output_folder: Path,
+    flatfield: np.ndarray,
+    dark: np.ndarray | float,
+    tile_name: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """
+    Resample both fields up to the full-resolution pyramid level.
+
+    The fit runs on a downsampled level for speed, but the correction is
+    applied to full-resolution voxels, so both the flatfield and the
+    darkfield have to be resampled to that extent.
+
+    The darkfield is resampled from the original image (or the scalar
+    camera offset), not from the plane that was matched to the estimation
+    level.
+
+    Parameters
+    ----------
+    label : str
+        Name used for the output files.
+    output_folder : Path
+        Folder to write into.
+    flatfield : np.ndarray
+        The fitted flatfield, at the estimation level.
+    dark : np.ndarray or float
+        The darkfield as supplied: an image at its own resolution, or a
+        scalar pedestal.
+    tile_name : str
+        Tile whose full-resolution extent stands for the channel's.
+    args : argparse.Namespace
+        Parsed command-line arguments.
+
+    Returns
+    -------
+    dict
+        The destination level, the shape written, the scale factor and
+        the paths of both fields.
+    """
+    shape = probe_plane_shape(args.base_path, tile_name, FULL_RESOLUTION_LEVEL)
+    suffix = f"_level{FULL_RESOLUTION_LEVEL}.npy"
+
+    flat_full = resize_plane(flatfield, shape)
+    flat_path = output_folder / f"flatfield_{label}{suffix}"
+    np.save(flat_path, flat_full)
+
+    dark_full = match_darkfield(dark, shape)
+    dark_path = output_folder / f"darkfield_{label}{suffix}"
+    np.save(dark_path, dark_full)
+
+    factor = shape[0] / flatfield.shape[0] if flatfield.shape[0] else None
+    logger.info(
+        "  Upsampled to level %s %s (from level %s, x%.3g): %s, %s",
+        FULL_RESOLUTION_LEVEL,
+        tuple(shape),
+        args.pyramid_level,
+        factor,
+        flat_path.name,
+        dark_path.name,
+    )
+    return {
+        "level": FULL_RESOLUTION_LEVEL,
+        "shape": list(shape),
+        "scale_factor": factor,
+        "flatfield_path": str(flat_path),
+        "darkfield_path": str(dark_path),
+        "probed_tile": tile_name,
+    }
+
 
 def _write_products(
     label: str,
@@ -336,6 +487,7 @@ def estimate_dataset(
     args: argparse.Namespace,
     output_folder: Path,
     basic_config: dict[str, Any],
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     """
     Estimate and save one flatfield from a folder of tiles.
@@ -354,6 +506,8 @@ def estimate_dataset(
         Folder the flatfield, darkfield and sidecar are written to.
     basic_config : dict
         BaSiC solver configuration for this run.
+    provenance : dict
+        Code, environment and argument provenance for this run.
 
     Returns
     -------
@@ -389,6 +543,18 @@ def estimate_dataset(
         label, output_folder, result, dark_plane, stack, tile_names, args
     )
 
+    upsampled = None
+    if args.upsample:
+        upsampled = upsample_to_full_resolution(
+            label,
+            output_folder,
+            result.flatfield,
+            dark,
+            tile_names[0],
+            args,
+        )
+
+    manifest_path = write_tile_manifest(label, output_folder, stack)
     sidecar = {
         "label": label,
         "base_path": args.base_path,
@@ -404,6 +570,7 @@ def estimate_dataset(
         "n_tiles": len(tile_names),
         "planes_per_tile": int(stack.n_planes),
         "n_fit_images": int(fit_slices.shape[0]),
+        "stack": summarize_stack(stack, fit_slices.shape[0], pedestal),
         "pyramid_level": args.pyramid_level,
         "darkfield_image": args.darkfield_image,
         "darkfield_value": (
@@ -413,6 +580,12 @@ def estimate_dataset(
         "pedestal": pedestal,
         "n_z_fits_ok": result.n_z_fits_ok,
         "validation": validation,
+        "upsampled": upsampled,
+        "provenance": provenance,
+        "metadata_files": {
+            "run_log": f"{METADATA_DIR}/{RUN_LOG_NAME}",
+            "tile_manifest": manifest_path,
+        },
         # The only record of which tiles produced this flatfield: the
         # names are not recoverable from anything else.
         "tiles": tile_names,
@@ -559,6 +732,16 @@ def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
         "60%% of Z.",
     )
     parser.add_argument(
+        "--upsample",
+        dest="upsample",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also save the flatfield and darkfield resampled from the "
+        "estimation pyramid level up to the full-resolution level, "
+        "whose extent is read from the dataset metadata (default: on; "
+        "disable with --no-upsample).",
+    )
+    parser.add_argument(
         "--validate",
         action="store_true",
         help="Emit X/Y intensity-profile plots for a few representative "
@@ -650,13 +833,18 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    logger.info("Starting BaSiC flatfield estimation with arguments: %s", args)
 
     # Keep JAX on CPU here and in every spawned worker.
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+    # The run log is attached before the first record, so that the file
+    # is a complete account of the run rather than missing its opening
+    # line.
+    started = utc_now()
     output_folder = Path(args.output_folder)
-    output_folder.mkdir(parents=True, exist_ok=True)
+    (output_folder / METADATA_DIR).mkdir(parents=True, exist_ok=True)
+    log_handler = attach_run_log(output_folder / METADATA_DIR / RUN_LOG_NAME)
+    logger.info("Starting BaSiC flatfield estimation with arguments: %s", args)
 
     # Resolved and checked before anything expensive: an unusable
     # solver configuration should not surface after a long tile load.
@@ -669,14 +857,24 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("Found %d tiles | output name: %s", len(tile_names), label)
 
     dark = load_darkfield(args.darkfield_image, args.darkfield_value)
-    estimate_dataset(
-        label, tile_names, dark, args, output_folder, basic_config
-    )
-
-    logger.info(
-        "Ending BaSiC flatfield estimation with outputs at: %s",
-        output_folder,
-    )
+    try:
+        estimate_dataset(
+            label,
+            tile_names,
+            dark,
+            args,
+            output_folder,
+            basic_config,
+            gather_provenance(args, started, utc_now()),
+        )
+        logger.info(
+            "Ending BaSiC flatfield estimation with outputs at: %s",
+            output_folder,
+        )
+    finally:
+        # Detached in a finally so a run that raises still leaves a
+        # complete, flushed log behind.
+        detach_run_log(log_handler)
 
 
 if __name__ == "__main__":

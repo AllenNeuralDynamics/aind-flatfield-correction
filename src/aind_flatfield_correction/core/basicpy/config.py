@@ -45,6 +45,11 @@ FF_SPAN_FLOOR = 0.100
 FF_STD_CEILING = 0.50
 FF_REL_FLOOR = 0.60
 
+# Seeds for the two subsamples the search draws.  Named so that a run
+# can record them rather than duplicating the literals.
+SUBSAMPLE_SEED = 42
+CONFIRM_SEED = 7
+
 # Fractional Z position of the plane used for the inspection figures.
 Z_FRACTION = 0.3
 

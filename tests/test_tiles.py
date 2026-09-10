@@ -246,6 +246,102 @@ class TestLoadFitStack(unittest.TestCase):
             stack = tiles.load_fit_stack("/data", ["a", "b"], 3, 40)
         self.assertLessEqual(stack.n_planes, 3)
 
+    def test_records_a_manifest_entry_per_tile(self):
+        """The only record of which planes the fit was built from."""
+        shapes = [(20, 8, 8)] * 3
+        with patch.object(
+            tiles, "open_tile", side_effect=self._arrays(shapes) * 2
+        ):
+            stack = tiles.load_fit_stack("/data", ["a", "b", "c"], 3, 6)
+        self.assertEqual(len(stack.manifest), 3)
+        self.assertEqual(
+            [record.name for record in stack.manifest], ["a", "b", "c"]
+        )
+
+    def test_the_manifest_records_the_planes_taken(self):
+        """Which Z indices, not just how many."""
+        shapes = [(20, 8, 8)]
+        with patch.object(
+            tiles, "open_tile", side_effect=self._arrays(shapes) * 2
+        ):
+            stack = tiles.load_fit_stack("/data", ["a"], 3, 2)
+        record = stack.manifest[0]
+        self.assertEqual(record.shape, (20, 8, 8))
+        self.assertEqual(len(record.z_indices), stack.n_planes)
+        self.assertTrue(all(4 <= z < 16 for z in record.z_indices))
+
+    def test_the_manifest_flags_a_padded_tile(self):
+        """A tile smaller than the rest leaves zeros in the stack."""
+        shapes = [(20, 8, 8), (20, 6, 6)]
+        with patch.object(
+            tiles, "open_tile", side_effect=self._arrays(shapes) * 2
+        ):
+            stack = tiles.load_fit_stack("/data", ["a", "b"], 3, 4)
+        self.assertFalse(stack.manifest[0].padded)
+        self.assertTrue(stack.manifest[1].padded)
+
+    def test_the_manifest_records_each_tile_mean(self):
+        """A dead tile shows up as a mean near zero."""
+        shapes = [(20, 8, 8), (20, 8, 8)]
+        with patch.object(
+            tiles, "open_tile", side_effect=self._arrays(shapes) * 2
+        ):
+            stack = tiles.load_fit_stack("/data", ["a", "b"], 3, 4)
+        self.assertEqual(stack.manifest[0].mean, 1.0)
+        self.assertEqual(stack.manifest[1].mean, 2.0)
+
+
+class TestResizePlane(unittest.TestCase):
+    """Resampling a 2-D field onto another extent."""
+
+    def test_upsamples_without_changing_the_value_range(self):
+        """preserve_range: these are gains, not [0, 1] intensities."""
+        plane = np.linspace(0.75, 1.25, 16).reshape(4, 4)
+        resized = tiles.resize_plane(plane, (16, 16))
+        self.assertEqual(resized.shape, (16, 16))
+        self.assertAlmostEqual(float(resized.min()), 0.75, places=5)
+        self.assertAlmostEqual(float(resized.max()), 1.25, places=5)
+
+    def test_downsamples_too(self):
+        """The same helper matches a darkfield to the fitting level."""
+        plane = np.linspace(0.0, 1.0, 256).reshape(16, 16)
+        self.assertEqual(tiles.resize_plane(plane, (4, 4)).shape, (4, 4))
+
+    def test_returns_the_input_when_the_shape_matches(self):
+        """No interpolation, and no needless copy."""
+        plane = np.ones((4, 4), dtype=np.float32)
+        self.assertIs(tiles.resize_plane(plane, (4, 4)), plane)
+
+    def test_always_returns_float32(self):
+        """Downstream saves and divisions expect it."""
+        plane = np.ones((4, 4), dtype=np.uint16)
+        self.assertEqual(tiles.resize_plane(plane, (8, 8)).dtype, np.float32)
+
+
+class TestProbePlaneShape(unittest.TestCase):
+    """Reading the destination extent from the dataset metadata."""
+
+    def test_reads_the_full_resolution_extent(self):
+        """The scale factor between levels is not assumed."""
+        arr = LazyArray(np.zeros((10, 64, 48), dtype=np.float32))
+        with patch.object(tiles, "open_tile", return_value=arr) as opener:
+            shape = tiles.probe_plane_shape("/data", CH405)
+        self.assertEqual(shape, (64, 48))
+        opener.assert_called_once_with("/data", CH405, "0")
+
+    def test_ignores_leading_axes(self):
+        """A tile may still carry its time and channel axes."""
+        arr = LazyArray(np.zeros((1, 1, 10, 32, 32), dtype=np.float32))
+        with patch.object(tiles, "open_tile", return_value=arr):
+            self.assertEqual(tiles.probe_plane_shape("/data", CH405), (32, 32))
+
+    def test_accepts_another_level(self):
+        """Callers can probe the level they are estimating on."""
+        arr = LazyArray(np.zeros((10, 8, 8), dtype=np.float32))
+        with patch.object(tiles, "open_tile", return_value=arr) as opener:
+            tiles.probe_plane_shape("/data", CH405, 3)
+        opener.assert_called_once_with("/data", CH405, 3)
+
 
 class TestLoadDarkfield(unittest.TestCase):
     """Resolving the darkfield from the command line."""

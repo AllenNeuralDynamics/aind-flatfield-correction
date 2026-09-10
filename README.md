@@ -79,13 +79,47 @@ Named after `--output-name`, or after the last segment of `base_path` if you omi
 | Path | Contents |
 |---|---|
 | `flatfield_<name>.npy` | The fitted flatfield, at the estimation pyramid level |
+| `flatfield_<name>_level0.npy` | The same flatfield resampled to full resolution, unless `--no-upsample` |
 | `darkfield_<name>.npy` | The darkfield plane that was actually subtracted before fitting |
-| `flatfield_<name>.json` | Sidecar: solver config, chosen parameters, search report, flatfield statistics, the plausibility verdict, and the list of tiles used |
+| `darkfield_<name>_level0.npy` | The darkfield at full resolution, unless `--no-upsample` |
+| `flatfield_<name>.json` | Sidecar: solver config, chosen parameters, search report, flatfield statistics, the plausibility verdict, provenance, and the list of tiles used |
+| `metadata/estimation.log` | The whole run's log |
+| `metadata/tiles_<name>.json` | One record per tile that contributed to the fit |
 | `<name>/*.png` | Inspection figures, only with `--validate` |
 
 `darkfield_<name>.npy` holds the pedestal used for the fit rather than BaSiC's own
 darkfield estimate — `get_darkfield` is off, so that estimate is all zeros, and the
 pedestal is what an apply step needs.
+
+Both levels are kept for each field: the estimation-level files are what was actually
+fitted and are the reproducible artifacts, while the
+full-resolution pair is what an apply step subtracts and divides by.
+
+The full-resolution darkfield is built from the darkfield **as you supplied it**.
+
+### Reproducing and diagnosing a run
+
+The sidecar is self-contained, there is no separate provenance format to reconcile. Its
+`provenance` block records the package version and git commit, the versions of every
+dependency a result actually depends on (`BaSiCPy`, `jax`, `numpy`, `scikit-image`, …), the
+full command line and **every** parsed argument, the sampling seeds, the resolved worker
+and CPU counts, the platform and host, and the run's start, end and duration. A supplied
+`--darkfield-image` is recorded with its SHA-256, so a silently swapped input is
+detectable.
+
+Two files sit alongside it in `metadata/`:
+
+- **`estimation.log`** — every record the run emitted, including per-candidate entropies
+  and worker tracebacks that otherwise exist only on the console. Attached to the root
+  logger, so jax, dask and botocore warnings land there too. It inherits whatever logging
+  configuration is already in place rather than imposing its own, this is useful if using personalized logging packages, such as ![log-schema](https://pypi.org/project/log-schema/).
+- **`tiles_<name>.json`** — per tile: its name, probed `(Z, H, W)`, the Z indices actually
+  loaded, the mean of those planes, and whether it was padded. A dead tile shows up as a
+  mean near zero, and a tile smaller than the rest is flagged rather than silently
+  contributing zeros to the fit.
+
+Between the two, a bad flatfield can usually be diagnosed without re-running the
+estimation.
 
 ## How it works
 
@@ -99,9 +133,7 @@ pedestal is what an apply step needs.
    pedestal of 90 — and yields a near-unity, no-op flatfield.
 3. **Choose `smoothness_flatfield`.** A two-stage search: a cheap screen over a
    logarithmic grid at reduced solver iterations, then the best few re-scored at full
-   fidelity. The objective is the differential entropy of the corrected intensity
-   histogram and it is **minimized** — basicpy's autotune returns `-entropy` to a
-   maximizing optimizer. A calibration gate projects the cost first and abandons the
+   fidelity. A calibration gate projects the cost first and abandons the
    search if it would exceed `--max-search-minutes`.
 4. **Confirm at scale.** In ladmap mode `init_mu` depends on N, so a winner found on ~150
    slices is refitted against the incumbent on `--n-confirm` slices and reverted unless it
@@ -111,6 +143,11 @@ pedestal is what an apply step needs.
    span. basicpy normalizes the flatfield mean to 1.0, so those thresholds are scale-free.
    A field that fails is refitted with the configured baseline; if it still fails, the run
    records it as `"suspicious": true` rather than passing it off as good.
+
+6. **Upsample to full resolution.** The fit runs on a downsampled level for speed, but
+   the correction is applied to full-resolution voxels, so both fields are resampled up to
+   the extent the dataset's own metadata reports for its highest-resolution level. On by default; turn it off with
+   `--no-upsample`.
 
 The incumbent the search must beat is whatever `smoothness_flatfield` the solver
 configuration carries, so a candidate can never make the result worse than the
@@ -129,6 +166,7 @@ configuration you supplied.
 | `--output-folder` | `flatfield_estimation` | Where the products are written |
 | `--method` | `fit` | `fit` is one joint fit; `per-z-median` fits each Z index across all tiles and takes the pixelwise median |
 | `--basic-config` | built-in | Solver configuration; see below |
+| `--upsample` / `--no-upsample` | on | Also save both fields resampled to the full-resolution level |
 | `--max-fit-planes` | `2000` | Image budget across all tiles |
 | `--validate` | off | Write the inspection figures |
 | `--validate-tiles` | `4` | How many tiles get a profile figure |
@@ -150,10 +188,6 @@ over** the built-in defaults — only the keys you want to change need to be giv
 The defaults are the vetted values: `ladmap` (which produced the known-good flatfields,
 where `approximate` was a regression), `max_reweight_iterations` raised to 35 from
 basicpy's 10, and `get_darkfield` off because the pedestal is removed beforehand.
-
-`smoothness_flatfield` is supplied the same way. It is the parameter the search varies, so
-the configured value is the incumbent every candidate is measured against, the value a
-failed fit falls back to, and — with `--skip-search` — the value fitted directly:
 
 ```bash
 --basic-config '{"smoothness_flatfield": 2.5}' --skip-search

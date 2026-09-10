@@ -22,8 +22,10 @@ import numpy as np
 from basicpy import BaSiC
 
 from aind_flatfield_correction.core.basicpy.config import (
+    CONFIRM_SEED,
     SELECT_TOL,
     SMOOTHNESS_KEY,
+    SUBSAMPLE_SEED,
     baseline_params,
     limit_worker_threads,
     search_grid,
@@ -121,7 +123,7 @@ def stratified_subsample(
     images: np.ndarray,
     n_target: int,
     tile_z_offsets: dict[int, tuple[int, int]] | None = None,
-    seed: int = 42,
+    seed: int = SUBSAMPLE_SEED,
 ) -> tuple[np.ndarray, int]:
     """
     Take about ``n_target`` slices, drawing equally from every tile.
@@ -141,7 +143,7 @@ def stratified_subsample(
         Per-tile ``(start, end)`` spans into ``images``. Without it the
         draw is uniform over the whole stack.
     seed : int, optional
-        Random seed, by default 42.
+        Random seed, by default :data:`SUBSAMPLE_SEED`.
 
     Returns
     -------
@@ -769,7 +771,7 @@ def confirm_against_baseline(
         The parameters to use and a report of the head-to-head.
     """
     sub, n_sub = stratified_subsample(
-        images, n_confirm, tile_z_offsets, seed=7
+        images, n_confirm, tile_z_offsets, seed=CONFIRM_SEED
     )
     logger.info(
         "  Confirming at N=%d (the search used far fewer slices)", n_sub

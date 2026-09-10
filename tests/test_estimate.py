@@ -15,7 +15,10 @@ from aind_flatfield_correction.core.basicpy.config import (
     BASIC_CONFIG,
     baseline_params,
 )
-from aind_flatfield_correction.core.basicpy.tiles import FitStack
+from aind_flatfield_correction.core.basicpy.tiles import (
+    FitStack,
+    TileRecord,
+)
 from tests.fakes import (
     InlineExecutor,
     LazyArray,
@@ -73,7 +76,17 @@ def _stack(n_tiles=4, planes=2, size=8):
         index: (index * planes, (index + 1) * planes)
         for index in range(n_tiles)
     }
-    return FitStack(slices, offsets, planes, size, size)
+    manifest = tuple(
+        TileRecord(
+            name=TILE_NAMES[index],
+            shape=(10, size, size),
+            z_indices=tuple(range(planes)),
+            mean=190.0,
+            padded=False,
+        )
+        for index in range(n_tiles)
+    )
+    return FitStack(slices, offsets, planes, size, size, manifest)
 
 
 def _args(**overrides):
@@ -492,17 +505,21 @@ class TestEstimateDataset(unittest.TestCase):
                 "_run_fit",
                 return_value=(_plausible(), np.zeros((8, 8)), None),
             ):
-                return estimate.estimate_dataset(
-                    "ch_405",
-                    TILE_NAMES,
-                    90.0,
-                    args,
-                    Path(tmp),
-                    dict(BASIC_CONFIG),
-                )
+                with patch.object(
+                    estimate, "probe_plane_shape", return_value=(32, 32)
+                ):
+                    return estimate.estimate_dataset(
+                        "ch_405",
+                        TILE_NAMES,
+                        90.0,
+                        args,
+                        Path(tmp),
+                        dict(BASIC_CONFIG),
+                        {"package_version": "1.0.0"},
+                    )
 
-    def test_writes_the_three_products(self):
-        """Flatfield, pedestal and sidecar, all named by the label."""
+    def test_writes_the_products(self):
+        """Both fields, their full-resolution twins, and the sidecar."""
         with tempfile.TemporaryDirectory() as tmp:
             self._run(tmp)
             written = sorted(path.name for path in Path(tmp).iterdir())
@@ -510,9 +527,45 @@ class TestEstimateDataset(unittest.TestCase):
             written,
             [
                 "darkfield_ch_405.npy",
+                "darkfield_ch_405_level0.npy",
                 "flatfield_ch_405.json",
                 "flatfield_ch_405.npy",
+                "flatfield_ch_405_level0.npy",
+                "metadata",
             ],
+        )
+
+    def test_upsamples_a_scalar_pedestal_to_a_constant_plane(self):
+        """A scalar needs filling at the destination extent, not resizing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run(tmp)
+            dark = np.load(Path(tmp) / "darkfield_ch_405_level0.npy")
+        self.assertEqual(dark.shape, (32, 32))
+        self.assertTrue(np.all(dark == 90.0))
+
+    def test_upsampling_can_be_turned_off(self):
+        """--no-upsample leaves only the estimation level."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp, upsample=False)
+            written = [path.name for path in Path(tmp).iterdir()]
+        self.assertNotIn("flatfield_ch_405_level0.npy", written)
+        self.assertNotIn("darkfield_ch_405_level0.npy", written)
+        self.assertIsNone(sidecar["upsampled"])
+
+    def test_the_sidecar_records_the_upsampling(self):
+        """Which level the full-resolution fields belong to."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp)
+        upsampled = sidecar["upsampled"]
+        self.assertEqual(upsampled["level"], "0")
+        self.assertEqual(upsampled["shape"], [32, 32])
+        self.assertEqual(upsampled["scale_factor"], 4.0)
+        self.assertEqual(upsampled["probed_tile"], TILE_NAMES[0])
+        self.assertTrue(
+            upsampled["flatfield_path"].endswith("flatfield_ch_405_level0.npy")
+        )
+        self.assertTrue(
+            upsampled["darkfield_path"].endswith("darkfield_ch_405_level0.npy")
         )
 
     def test_the_sidecar_records_the_provenance(self):
@@ -536,6 +589,35 @@ class TestEstimateDataset(unittest.TestCase):
         self.assertEqual(sidecar["darkfield_mean"], 90.0)
         self.assertEqual(sidecar["pedestal"]["median_raw"], 190.0)
 
+    def test_writes_the_tile_manifest(self):
+        """One record per tile, in the metadata folder."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp)
+            manifest = json.loads(
+                (Path(tmp) / "metadata" / "tiles_ch_405.json").read_text()
+            )
+        self.assertEqual(len(manifest), len(TILE_NAMES))
+        self.assertEqual(
+            sidecar["metadata_files"]["tile_manifest"],
+            "metadata/tiles_ch_405.json",
+        )
+
+    def test_the_sidecar_summarizes_the_stack(self):
+        """Extent, plane counts and intensity range of what was fitted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp)
+        summary = sidecar["stack"]
+        self.assertEqual((summary["height"], summary["width"]), (8, 8))
+        self.assertEqual(summary["n_images"], 8)
+        self.assertEqual(summary["median"], 190.0)
+        self.assertEqual(summary["n_padded_tiles"], 0)
+
+    def test_the_sidecar_carries_the_provenance(self):
+        """Passed in by main, recorded verbatim."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp)
+        self.assertEqual(sidecar["provenance"]["package_version"], "1.0.0")
+
     def test_the_sidecar_is_json_serializable(self):
         """numpy scalars would otherwise break the dump."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -543,34 +625,110 @@ class TestEstimateDataset(unittest.TestCase):
             json.loads((Path(tmp) / "flatfield_ch_405.json").read_text())
 
 
-class TestMain(unittest.TestCase):
-    """The entry point, end to end."""
+class TestUpsampleToFullResolution(unittest.TestCase):
+    """Resampling both fields to the full-resolution extent."""
 
-    def _tile_arrays(self, n_tiles=4, size=8):
+    def _upsample(self, tmp, dark):
         """
-        Build one lazy array per tile, above a pedestal.
+        Upsample against a probed extent of 32x32.
 
         Parameters
         ----------
-        n_tiles : int, optional
-            Number of tiles, by default 4.
-        size : int, optional
-            Plane height and width, by default 8.
+        tmp : str
+            Output folder.
+        dark : np.ndarray or float
+            Darkfield as supplied by the caller.
 
         Returns
         -------
-        list of LazyArray
-            Arrays for the probe pass and the load pass.
+        dict
+            The upsampling record.
         """
-        values = np.full((10, size, size), 190.0, dtype=np.float32)
-        return [LazyArray(values) for _ in range(n_tiles * 2)]
+        with patch.object(
+            estimate, "probe_plane_shape", return_value=(32, 32)
+        ):
+            return estimate.upsample_to_full_resolution(
+                "ch_405",
+                Path(tmp),
+                _plausible(),
+                dark,
+                TILE_NAMES[0],
+                _args(),
+            )
+
+    def test_resamples_a_darkfield_image_from_the_original(self):
+        """Not from the copy matched to the estimation level.
+
+        A darkfield already at full resolution must come back
+        bit-identical; going via the downsampled copy would blur it.
+        """
+        original = np.linspace(80.0, 100.0, 32 * 32, dtype=np.float32)
+        original = original.reshape(32, 32)
+        with tempfile.TemporaryDirectory() as tmp:
+            self._upsample(tmp, original)
+            written = np.load(Path(tmp) / "darkfield_ch_405_level0.npy")
+        np.testing.assert_array_equal(written, original)
+
+    def test_resamples_a_low_resolution_darkfield_image(self):
+        """A darkfield captured at a coarser extent still scales up."""
+        coarse = np.full((8, 8), 95.0, dtype=np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            self._upsample(tmp, coarse)
+            written = np.load(Path(tmp) / "darkfield_ch_405_level0.npy")
+        self.assertEqual(written.shape, (32, 32))
+        self.assertTrue(np.allclose(written, 95.0))
+
+    def test_reports_the_scale_factor(self):
+        """Read from the metadata, not assumed from the level number."""
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self._upsample(tmp, 90.0)
+        self.assertEqual(record["scale_factor"], 4.0)
+        self.assertEqual(record["shape"], [32, 32])
+
+    def test_preserves_the_flatfield_value_range(self):
+        """Interpolating a gain field must not rescale it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._upsample(tmp, 90.0)
+            written = np.load(Path(tmp) / "flatfield_ch_405_level0.npy")
+        self.assertAlmostEqual(float(written.min()), 0.75, places=5)
+        self.assertAlmostEqual(float(written.max()), 1.25, places=5)
+
+
+class TestMain(unittest.TestCase):
+    """The entry point, end to end."""
+
+    def _open_tile(self, base_path, name, level):
+        """
+        Serve a tile plane above a pedestal, sized by pyramid level.
+
+        Answers any number of calls, which the shape probe, the plane
+        load and the full-resolution probe all make. The full-resolution
+        level is four times the estimation level, so the upsampling has
+        something real to do.
+
+        Parameters
+        ----------
+        base_path : str
+            Ignored.
+        name : str
+            Ignored.
+        level : int or str
+            Multiscale level being opened.
+
+        Returns
+        -------
+        LazyArray
+            A ``(10, H, W)`` stack for that level.
+        """
+        size = 32 if str(level) == "0" else 8
+        return LazyArray(np.full((10, size, size), 190.0, dtype=np.float32))
 
     def test_estimates_and_writes_a_flatfield(self):
         """From a folder of tiles to a saved flatfield and sidecar."""
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
                 with patch.object(
-                    tiles, "open_tile", side_effect=self._tile_arrays()
+                    tiles, "open_tile", side_effect=self._open_tile
                 ):
                     with patch.object(fit, "BaSiC", make_basic()):
                         estimate.main(
@@ -589,12 +747,67 @@ class TestMain(unittest.TestCase):
         self.assertIn("flatfield_ch_405.npy", written)
         self.assertIn("flatfield_ch_405.json", written)
 
+    def test_writes_the_upsampled_flatfield_by_default(self):
+        """On without asking, at the extent the metadata reports."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
+                with patch.object(
+                    tiles, "open_tile", side_effect=self._open_tile
+                ):
+                    with patch.object(fit, "BaSiC", make_basic()):
+                        estimate.main(
+                            [
+                                "/data/ch_405",
+                                "--skip-search",
+                                "--max-fit-planes",
+                                "8",
+                                "--output-folder",
+                                tmp,
+                            ]
+                        )
+            estimated = np.load(Path(tmp) / "flatfield_ch_405.npy")
+            upsampled = np.load(Path(tmp) / "flatfield_ch_405_level0.npy")
+        self.assertEqual(estimated.shape, (8, 8))
+        self.assertEqual(upsampled.shape, (32, 32))
+
+    def test_writes_the_run_log_and_manifest(self):
+        """A Code Ocean run keeps its own diagnostics."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
+                with patch.object(
+                    tiles, "open_tile", side_effect=self._open_tile
+                ):
+                    with patch.object(fit, "BaSiC", make_basic()):
+                        estimate.main(
+                            [
+                                "/data/ch_405",
+                                "--skip-search",
+                                "--max-fit-planes",
+                                "8",
+                                "--output-folder",
+                                tmp,
+                            ]
+                        )
+            metadata = Path(tmp) / "metadata"
+            written = sorted(path.name for path in metadata.iterdir())
+            sidecar = json.loads(
+                (Path(tmp) / "flatfield_ch_405.json").read_text()
+            )
+        # The suite disables logging, so the log file is created but
+        # empty; its contents are covered in tests/test_provenance.py.
+        self.assertEqual(written, ["estimation.log", "tiles_ch_405.json"])
+        self.assertEqual(
+            sidecar["metadata_files"]["run_log"], "metadata/estimation.log"
+        )
+        self.assertIsNotNone(sidecar["provenance"]["command"])
+        self.assertEqual(sidecar["provenance"]["args"]["max_fit_planes"], 8)
+
     def test_writes_the_figures_when_validating(self):
         """--validate produces the per-tile profile plots."""
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
                 with patch.object(
-                    tiles, "open_tile", side_effect=self._tile_arrays()
+                    tiles, "open_tile", side_effect=self._open_tile
                 ):
                     with patch.object(fit, "BaSiC", make_basic()):
                         estimate.main(
@@ -621,7 +834,7 @@ class TestMain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
                 with patch.object(
-                    tiles, "open_tile", side_effect=self._tile_arrays()
+                    tiles, "open_tile", side_effect=self._open_tile
                 ):
                     with patch.object(fit, "BaSiC", make_basic()):
                         with patch.object(
@@ -655,7 +868,7 @@ class TestMain(unittest.TestCase):
                 estimate, "list_tiles", return_value=TILE_NAMES
             ) as lister:
                 with patch.object(
-                    tiles, "open_tile", side_effect=self._tile_arrays()
+                    tiles, "open_tile", side_effect=self._open_tile
                 ):
                     with patch.object(fit, "BaSiC", make_basic()):
                         estimate.main(
@@ -681,7 +894,7 @@ class TestMain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
                 with patch.object(
-                    tiles, "open_tile", side_effect=self._tile_arrays()
+                    tiles, "open_tile", side_effect=self._open_tile
                 ):
                     recorded = []
                     with patch.object(
@@ -712,7 +925,7 @@ class TestMain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
                 with patch.object(
-                    tiles, "open_tile", side_effect=self._tile_arrays()
+                    tiles, "open_tile", side_effect=self._open_tile
                 ):
                     recorded = []
                     with patch.object(
@@ -759,7 +972,7 @@ class TestMain(unittest.TestCase):
             nested = Path(tmp) / "results" / "flatfields"
             with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
                 with patch.object(
-                    tiles, "open_tile", side_effect=self._tile_arrays()
+                    tiles, "open_tile", side_effect=self._open_tile
                 ):
                     with patch.object(fit, "BaSiC", make_basic()):
                         estimate.main(
