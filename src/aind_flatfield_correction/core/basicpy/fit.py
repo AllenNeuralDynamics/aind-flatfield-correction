@@ -25,6 +25,37 @@ from aind_flatfield_correction.core.basicpy.config import (
 logger = logging.getLogger(__name__)
 
 
+def validate_basic_config(config: dict[str, Any]) -> None:
+    """
+    Construct a BaSiC with ``config`` so a bad key fails immediately.
+
+    Worth doing before anything else: the configuration is only used
+    after every tile has been streamed in, so an unknown or ill-typed
+    key would otherwise surface as a solver error half an hour into a
+    run.
+
+    Parameters
+    ----------
+    config : dict
+        BaSiC keyword arguments to check.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    Exception
+        Whatever BaSiC raises for the offending key, after logging the
+        configuration that was rejected.
+    """
+    try:
+        BaSiC(**config)
+    except Exception:
+        logger.error("BaSiC rejected the configuration %s", config)
+        raise
+
+
 def _fit_one_z(
     shm_name: str,
     shape: tuple[int, ...],

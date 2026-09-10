@@ -112,6 +112,7 @@ def make_basic(
     fail: bool = False,
     record: list[dict[str, Any]] | None = None,
     span: float = 0.5,
+    fail_init: bool = False,
 ):
     """
     Build a fake ``BaSiC`` class.
@@ -130,6 +131,9 @@ def make_basic(
         List that every constructor's keyword arguments are appended to.
     span : float, optional
         Peak-to-peak width of the fitted flatfield, by default 0.5.
+    fail_init : bool, optional
+        Raise ``TypeError`` from the constructor, standing in for a
+        configuration basicpy rejects, by default False.
 
     Returns
     -------
@@ -152,7 +156,14 @@ def make_basic(
             Returns
             -------
             None
+
+            Raises
+            ------
+            TypeError
+                If the fake was built with ``fail_init=True``.
             """
+            if fail_init:
+                raise TypeError("unexpected keyword argument")
             self.kwargs = kwargs
             self.flatfield = np.ones((1, 1), dtype=np.float32)
             self.darkfield = np.zeros((1, 1), dtype=np.float32)

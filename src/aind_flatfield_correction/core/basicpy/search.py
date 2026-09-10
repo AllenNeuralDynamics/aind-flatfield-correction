@@ -22,10 +22,11 @@ import numpy as np
 from basicpy import BaSiC
 
 from aind_flatfield_correction.core.basicpy.config import (
-    MANUAL_PARAMS,
-    SEARCH_GRID,
     SELECT_TOL,
+    SMOOTHNESS_KEY,
+    baseline_params,
     limit_worker_threads,
+    search_grid,
     worker_pool_size,
 )
 
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 class Baseline(NamedTuple):
-    """Reference fit with ``MANUAL_PARAMS``, used as the incumbent."""
+    """The configuration's own fit, used as the search's incumbent."""
 
     val_range: float
     entropy: float
@@ -344,7 +345,7 @@ def _fit_baseline(
         wall-clock cost of one full-fidelity fit.
     """
     started = time.monotonic()
-    ref = BaSiC(**{**base_config, **MANUAL_PARAMS})
+    ref = BaSiC(**base_config)
     ref.fit(eval_images)
     transformed = np.asarray(ref.transform(eval_images), dtype=np.float64)
     vmin, vmax = np.quantile(transformed, [0.01, 0.99])
@@ -353,9 +354,9 @@ def _fit_baseline(
     elapsed = time.monotonic() - started
     flat = np.asarray(ref.flatfield)
     logger.info(
-        "  Baseline (manual) smoothness_flatfield=%g: entropy=%.6f  "
+        "  Baseline (configured) smoothness_flatfield=%g: entropy=%.6f  "
         "flatfield std=%.4f span=%.4f",
-        MANUAL_PARAMS["smoothness_flatfield"],
+        baseline_params(base_config)[SMOOTHNESS_KEY],
         entropy,
         float(flat.std()),
         float(np.ptp(flat)),
@@ -369,6 +370,7 @@ def _project_search_minutes(
     n_workers: int,
     screen_iters: int,
     n_stage2: int,
+    n_candidates: int,
 ) -> float:
     """
     Project the optimistic wall-clock cost of the two-stage search.
@@ -385,6 +387,8 @@ def _project_search_minutes(
         Reduced iteration count used by the stage-1 screen.
     n_stage2 : int
         Finalists re-scored at full fidelity.
+    n_candidates : int
+        Size of the stage-1 grid, which depends on the incumbent.
 
     Returns
     -------
@@ -392,7 +396,7 @@ def _project_search_minutes(
         Optimistic projection in minutes.
     """
     full_iters = base_config.get("max_reweight_iterations", 10)
-    waves_1 = math.ceil(len(SEARCH_GRID) / n_workers)
+    waves_1 = math.ceil(n_candidates / n_workers)
     waves_2 = math.ceil((n_stage2 + 1) / n_workers)
     projected = (
         baseline.fit_seconds
@@ -406,7 +410,7 @@ def _project_search_minutes(
         baseline.fit_seconds,
         projected,
         3 * projected,
-        len(SEARCH_GRID),
+        n_candidates,
         screen_iters,
         n_stage2 + 1,
         full_iters,
@@ -415,7 +419,9 @@ def _project_search_minutes(
 
 
 def _select_winner(
-    scores: dict[float, float], baseline_entropy: float
+    scores: dict[float, float],
+    baseline_entropy: float,
+    baseline: dict[str, float],
 ) -> tuple[dict[str, float], float]:
     """
     Pick the lowest-entropy candidate, with the baseline as incumbent.
@@ -425,17 +431,20 @@ def _select_winner(
     scores : dict
         ``{smoothness_flatfield: entropy}`` at full fidelity.
     baseline_entropy : float
-        Entropy of the manual parameters.
+        Entropy of the incumbent.
+    baseline : dict
+        The incumbent parameters, which win unless a candidate beats
+        them by ``SELECT_TOL``.
 
     Returns
     -------
     tuple of (dict, float)
         Winning parameters and their entropy.
     """
-    best_params, best_entropy = dict(MANUAL_PARAMS), baseline_entropy
+    best_params, best_entropy = dict(baseline), baseline_entropy
     for smoothness in sorted(scores):  # deterministic tie ordering
         if scores[smoothness] < best_entropy - SELECT_TOL:
-            best_params = {"smoothness_flatfield": smoothness}
+            best_params = {SMOOTHNESS_KEY: smoothness}
             best_entropy = scores[smoothness]
     return best_params, best_entropy
 
@@ -520,14 +529,16 @@ def _screen_and_rescore(
         ``{smoothness_flatfield: entropy}`` at full fidelity, or None
         when every stage-1 candidate failed.
     """
+    baseline_smoothness = baseline_params(base_config)[SMOOTHNESS_KEY]
+    candidates = search_grid(baseline_smoothness)
     logger.info(
-        "  Stage 1: screening %d candidates at " "max_reweight_iterations=%d",
-        len(SEARCH_GRID),
+        "  Stage 1: screening %d candidates at max_reweight_iterations=%d",
+        len(candidates),
         screen_iters,
     )
     stage1 = _run_candidate_wave(
         eval_images,
-        SEARCH_GRID,
+        candidates,
         base_config,
         baseline.val_range,
         n_workers,
@@ -538,12 +549,12 @@ def _screen_and_rescore(
     finite = {sf: ent for sf, ent in stage1.items() if np.isfinite(ent)}
     if not finite:
         logger.error(
-            "  !! every stage-1 candidate failed - using manual params"
+            "  !! every stage-1 candidate failed - keeping the "
+            "configured smoothness"
         )
         return None
 
     finalists = sorted(finite, key=lambda sf: finite[sf])[:n_stage2]
-    baseline_smoothness = MANUAL_PARAMS["smoothness_flatfield"]
     if baseline_smoothness not in finalists:
         finalists.append(baseline_smoothness)
     logger.info(
@@ -571,6 +582,7 @@ def _finalize_report(
     best_params: dict[str, float],
     best_entropy: float,
     baseline: Baseline,
+    incumbent: dict[str, float],
 ) -> None:
     """
     Record the search outcome in ``report`` and log the verdict.
@@ -586,7 +598,9 @@ def _finalize_report(
     best_entropy : float
         Entropy of the selected parameters.
     baseline : Baseline
-        The incumbent, for the margin of the win.
+        The incumbent's fit, for the margin of the win.
+    incumbent : dict
+        The incumbent parameters, to recognise a baseline win.
 
     Returns
     -------
@@ -597,11 +611,11 @@ def _finalize_report(
         key=lambda pair: pair[1],
     )
     report["best_entropy"] = float(best_entropy)
-    report["chose_baseline"] = best_params == dict(MANUAL_PARAMS)
+    report["chose_baseline"] = best_params == dict(incumbent)
     if report["chose_baseline"]:
         logger.info(
-            "  No candidate beat the manual baseline -> keeping manual "
-            "params."
+            "  No candidate beat the configured baseline -> keeping %s.",
+            incumbent,
         )
     else:
         logger.info(
@@ -665,7 +679,8 @@ def parallel_autotune(
     )
 
     baseline = _fit_baseline(eval_images, base_config)
-    baseline_smoothness = MANUAL_PARAMS["smoothness_flatfield"]
+    incumbent = baseline_params(base_config)
+    baseline_smoothness = incumbent[SMOOTHNESS_KEY]
     report: dict[str, Any] = {
         "baseline_entropy": baseline.entropy,
         "baseline_std": baseline.std,
@@ -674,20 +689,26 @@ def parallel_autotune(
         "best_entropy": baseline.entropy,
         "ranked_stage2": [],
         "reason": None,
+        "baseline_params": dict(incumbent),
     }
 
     projected = _project_search_minutes(
-        baseline, base_config, n_workers, screen_iters, n_stage2
+        baseline,
+        base_config,
+        n_workers,
+        screen_iters,
+        n_stage2,
+        len(search_grid(baseline_smoothness)),
     )
     if projected * 2 > max_search_minutes:
         logger.warning(
-            "  !! projection exceeds the budget of %.0f min - using "
-            "manual params (raise --max-search-minutes or lower "
-            "--max-eval-slices to search anyway)",
+            "  !! projection exceeds the budget of %.0f min - keeping "
+            "the configured smoothness (raise --max-search-minutes or "
+            "lower --max-eval-slices to search anyway)",
             max_search_minutes,
         )
         report["reason"] = "over_budget"
-        return dict(MANUAL_PARAMS), report
+        return dict(incumbent), report
 
     stage2 = _screen_and_rescore(
         eval_images,
@@ -700,11 +721,15 @@ def parallel_autotune(
     )
     if stage2 is None:
         report["reason"] = "all_candidates_failed"
-        return dict(MANUAL_PARAMS), report
+        return dict(incumbent), report
 
-    best_params, best_entropy = _select_winner(stage2, baseline.entropy)
+    best_params, best_entropy = _select_winner(
+        stage2, baseline.entropy, incumbent
+    )
     _log_ranking(stage2, baseline_smoothness, best_params)
-    _finalize_report(report, stage2, best_params, best_entropy, baseline)
+    _finalize_report(
+        report, stage2, best_params, best_entropy, baseline, incumbent
+    )
     return best_params, report
 
 
@@ -750,7 +775,7 @@ def confirm_against_baseline(
         "  Confirming at N=%d (the search used far fewer slices)", n_sub
     )
 
-    incumbent = BaSiC(**{**base_config, **MANUAL_PARAMS})
+    incumbent = BaSiC(**base_config)
     incumbent.fit(sub)
     transformed = np.asarray(incumbent.transform(sub), dtype=np.float64)
     vmin, vmax = np.quantile(transformed, [0.01, 0.99])
@@ -785,7 +810,8 @@ def confirm_against_baseline(
         info["held_up"] = True
         return dict(winner_params), info
     logger.info(
-        "    winner did not hold up at scale -> reverting to manual " "params."
+        "    winner did not hold up at scale -> reverting to the "
+        "configured smoothness."
     )
     info["held_up"] = False
-    return dict(MANUAL_PARAMS), info
+    return baseline_params(base_config), info

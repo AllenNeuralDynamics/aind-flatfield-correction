@@ -33,6 +33,21 @@ def _plausible(height=8, width=8, span=0.5):
     return ramp.reshape(height, width).astype(np.float32)
 
 
+class TestValidateBasicConfig(unittest.TestCase):
+    """Checking a solver configuration before anything expensive."""
+
+    def test_accepts_a_usable_configuration(self):
+        """The happy path constructs a solver and discards it."""
+        with patch.object(fit, "BaSiC", make_basic()):
+            self.assertIsNone(fit.validate_basic_config(BASIC_CONFIG))
+
+    def test_raises_on_a_configuration_basicpy_rejects(self):
+        """A typo'd key must fail now, not after every tile is loaded."""
+        with patch.object(fit, "BaSiC", make_basic(fail_init=True)):
+            with self.assertRaises(TypeError):
+                fit.validate_basic_config({"fiting_mode": "ladmap"})
+
+
 class TestFitOneZ(unittest.TestCase):
     """The per-Z worker."""
 

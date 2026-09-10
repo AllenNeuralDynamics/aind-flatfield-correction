@@ -11,7 +11,10 @@ from unittest.mock import patch
 import numpy as np
 
 from aind_flatfield_correction.core.basicpy import estimate, fit, tiles
-from aind_flatfield_correction.core.basicpy.config import MANUAL_PARAMS
+from aind_flatfield_correction.core.basicpy.config import (
+    BASIC_CONFIG,
+    baseline_params,
+)
 from aind_flatfield_correction.core.basicpy.tiles import FitStack
 from tests.fakes import (
     InlineExecutor,
@@ -172,10 +175,22 @@ class TestSelectParameters(unittest.TestCase):
             np.ones((4, 4, 4), dtype=np.float32),
             {0: (0, 4)},
             _args(skip_search=True),
+            BASIC_CONFIG,
         )
-        self.assertEqual(params, dict(MANUAL_PARAMS))
+        self.assertEqual(params, baseline_params(BASIC_CONFIG))
         self.assertEqual(report["reason"], "skip_search_flag")
         self.assertIsNone(confirm)
+
+    def test_skip_search_fits_a_supplied_smoothness(self):
+        """--basic-config is how a hand-tuned value is provided."""
+        config = {**BASIC_CONFIG, "smoothness_flatfield": 2.5}
+        params, _, _ = estimate.select_parameters(
+            np.ones((4, 4, 4), dtype=np.float32),
+            {0: (0, 4)},
+            _args(skip_search=True),
+            config,
+        )
+        self.assertEqual(params, {"smoothness_flatfield": 2.5})
 
     def test_does_not_confirm_a_baseline_win(self):
         """There is nothing to confirm if the incumbent won."""
@@ -183,7 +198,7 @@ class TestSelectParameters(unittest.TestCase):
         with patch.object(
             estimate,
             "parallel_autotune",
-            return_value=(dict(MANUAL_PARAMS), report),
+            return_value=(baseline_params(BASIC_CONFIG), report),
         ):
             with patch.object(
                 estimate, "confirm_against_baseline"
@@ -192,6 +207,7 @@ class TestSelectParameters(unittest.TestCase):
                     np.ones((4, 4, 4), dtype=np.float32),
                     {0: (0, 4)},
                     _args(),
+                    BASIC_CONFIG,
                 )
         confirmer.assert_not_called()
         self.assertIsNone(confirm)
@@ -213,6 +229,7 @@ class TestSelectParameters(unittest.TestCase):
                     np.ones((4, 4, 4), dtype=np.float32),
                     {0: (0, 4)},
                     _args(),
+                    BASIC_CONFIG,
                 )
         confirmer.assert_called_once()
         self.assertEqual(params, winner)
@@ -233,6 +250,7 @@ class TestSelectParameters(unittest.TestCase):
                     np.ones((4, 4, 4), dtype=np.float32),
                     {0: (0, 4)},
                     _args(n_confirm=0),
+                    BASIC_CONFIG,
                 )
         confirmer.assert_not_called()
         self.assertIsNone(confirm)
@@ -283,6 +301,7 @@ class TestFitWithGuard(unittest.TestCase):
                 "fit",
                 {"smoothness_flatfield": 0.5},
                 None,
+                BASIC_CONFIG,
             )
         self.assertEqual(runner.call_count, 1)
         self.assertTrue(result.ok)
@@ -302,9 +321,29 @@ class TestFitWithGuard(unittest.TestCase):
                 "fit",
                 {"smoothness_flatfield": 0.5},
                 None,
+                BASIC_CONFIG,
             )
         self.assertTrue(result.ok)
-        self.assertEqual(result.params, dict(MANUAL_PARAMS))
+        self.assertEqual(result.params, baseline_params(BASIC_CONFIG))
+
+    def test_refits_with_a_supplied_smoothness(self):
+        """The fallback is the configured value, not the built-in 1.0."""
+        stack = _stack()
+        config = {**BASIC_CONFIG, "smoothness_flatfield": 2.5}
+        outcomes = [
+            (np.ones((8, 8)), np.zeros((8, 8)), None),
+            (_plausible(), np.zeros((8, 8)), None),
+        ]
+        with patch.object(estimate, "_run_fit", side_effect=outcomes):
+            result = estimate.fit_with_guard(
+                stack.slices,
+                stack,
+                "fit",
+                {"smoothness_flatfield": 0.5},
+                None,
+                config,
+            )
+        self.assertEqual(result.params, {"smoothness_flatfield": 2.5})
 
     def test_does_not_refit_what_the_manual_params_produced(self):
         """Refitting the same parameters would give the same field."""
@@ -315,7 +354,12 @@ class TestFitWithGuard(unittest.TestCase):
             return_value=(np.ones((8, 8)), np.zeros((8, 8)), None),
         ) as runner:
             result = estimate.fit_with_guard(
-                stack.slices, stack, "fit", dict(MANUAL_PARAMS), None
+                stack.slices,
+                stack,
+                "fit",
+                baseline_params(BASIC_CONFIG),
+                None,
+                BASIC_CONFIG,
             )
         self.assertEqual(runner.call_count, 1)
         self.assertFalse(result.ok)
@@ -331,6 +375,7 @@ class TestFitWithGuard(unittest.TestCase):
                 "fit",
                 {"smoothness_flatfield": 0.5},
                 None,
+                BASIC_CONFIG,
             )
         self.assertFalse(result.ok)
         self.assertTrue(result.reasons)
@@ -352,7 +397,7 @@ class TestWriteProducts(unittest.TestCase):
             _plausible(),
             np.zeros((8, 8)),
             None,
-            dict(MANUAL_PARAMS),
+            baseline_params(BASIC_CONFIG),
             True,
             {},
             [],
@@ -448,7 +493,12 @@ class TestEstimateDataset(unittest.TestCase):
                 return_value=(_plausible(), np.zeros((8, 8)), None),
             ):
                 return estimate.estimate_dataset(
-                    "ch_405", TILE_NAMES, 90.0, args, Path(tmp)
+                    "ch_405",
+                    TILE_NAMES,
+                    90.0,
+                    args,
+                    Path(tmp),
+                    dict(BASIC_CONFIG),
                 )
 
     def test_writes_the_three_products(self):
@@ -625,6 +675,83 @@ class TestMain(unittest.TestCase):
             self.assertTrue((Path(tmp) / "flatfield_ch405.npy").exists())
         pattern = lister.call_args[0][1]
         self.assertEqual(pattern.pattern, "_ch_405")
+
+    def test_passes_a_supplied_basic_config_to_the_fit(self):
+        """The override reaches the solver and the sidecar."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
+                with patch.object(
+                    tiles, "open_tile", side_effect=self._tile_arrays()
+                ):
+                    recorded = []
+                    with patch.object(
+                        fit, "BaSiC", make_basic(record=recorded)
+                    ):
+                        estimate.main(
+                            [
+                                "/data/ch_405",
+                                "--skip-search",
+                                "--basic-config",
+                                '{"sort_intensity": false}',
+                                "--max-fit-planes",
+                                "8",
+                                "--output-folder",
+                                tmp,
+                            ]
+                        )
+            sidecar = json.loads(
+                (Path(tmp) / "flatfield_ch_405.json").read_text()
+            )
+        self.assertFalse(sidecar["basic_config"]["sort_intensity"])
+        # The default that was not overridden must survive.
+        self.assertEqual(sidecar["basic_config"]["fitting_mode"], "ladmap")
+        self.assertFalse(recorded[-1]["sort_intensity"])
+
+    def test_a_supplied_smoothness_reaches_the_fit_and_sidecar(self):
+        """The answer to "how do I provide the smoothness"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(estimate, "list_tiles", return_value=TILE_NAMES):
+                with patch.object(
+                    tiles, "open_tile", side_effect=self._tile_arrays()
+                ):
+                    recorded = []
+                    with patch.object(
+                        fit, "BaSiC", make_basic(record=recorded)
+                    ):
+                        estimate.main(
+                            [
+                                "/data/ch_405",
+                                "--skip-search",
+                                "--basic-config",
+                                '{"smoothness_flatfield": 2.5}',
+                                "--max-fit-planes",
+                                "8",
+                                "--output-folder",
+                                tmp,
+                            ]
+                        )
+            sidecar = json.loads(
+                (Path(tmp) / "flatfield_ch_405.json").read_text()
+            )
+        self.assertEqual(sidecar["params"]["smoothness_flatfield"], 2.5)
+        self.assertEqual(sidecar["basic_config"]["smoothness_flatfield"], 2.5)
+        self.assertEqual(recorded[-1]["smoothness_flatfield"], 2.5)
+
+    def test_rejects_a_bad_basic_config_before_loading_tiles(self):
+        """An unusable configuration must not cost a full tile load."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(estimate, "list_tiles") as lister:
+                with self.assertRaises(FileNotFoundError):
+                    estimate.main(
+                        [
+                            "/data/ch_405",
+                            "--basic-config",
+                            "/no/such/config.json",
+                            "--output-folder",
+                            tmp,
+                        ]
+                    )
+        lister.assert_not_called()
 
     def test_creates_a_missing_output_folder(self):
         """The folder is named on the command line, not created first."""

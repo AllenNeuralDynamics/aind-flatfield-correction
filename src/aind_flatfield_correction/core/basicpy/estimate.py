@@ -29,6 +29,23 @@ and combining by pixelwise median, and write the inspection figures::
     python -m aind_flatfield_correction.core.basicpy.estimate <base_path> \\
         --tile-pattern '_ch_405\\.ome\\.zarr$' --output-name ch405 \\
         --method per-z-median --validate --output-folder ./flatfields
+
+Override part of the solver configuration, inline or from a file.  The
+given keys are merged over the built-in defaults::
+
+    python -m aind_flatfield_correction.core.basicpy.estimate <base_path> \\
+        --basic-config '{"fitting_mode": "approximate"}'
+
+    python -m aind_flatfield_correction.core.basicpy.estimate <base_path> \\
+        --basic-config ./basic_config.json
+
+``smoothness_flatfield`` is supplied the same way.  It is the parameter
+the search varies, so the configured value is the incumbent every
+candidate is measured against; with ``--skip-search`` it is fitted
+directly::
+
+    python -m aind_flatfield_correction.core.basicpy.estimate <base_path> \\
+        --basic-config '{"smoothness_flatfield": 2.5}' --skip-search
 """
 
 from __future__ import annotations
@@ -45,8 +62,8 @@ from typing import Any, NamedTuple
 import numpy as np
 
 from aind_flatfield_correction.core.basicpy.config import (
-    BASIC_CONFIG,
-    MANUAL_PARAMS,
+    baseline_params,
+    load_basic_config,
 )
 from aind_flatfield_correction.core.basicpy.figures import (
     save_validation_figures,
@@ -55,6 +72,7 @@ from aind_flatfield_correction.core.basicpy.fit import (
     estimate_joint,
     estimate_per_z_median,
     report_flatfield,
+    validate_basic_config,
 )
 from aind_flatfield_correction.core.basicpy.search import (
     confirm_against_baseline,
@@ -106,6 +124,7 @@ def select_parameters(
     fit_slices: np.ndarray,
     z_offsets: dict[int, tuple[int, int]],
     args: argparse.Namespace,
+    basic_config: dict[str, Any],
 ) -> tuple[dict[str, float], dict[str, Any], dict[str, Any] | None]:
     """
     Choose ``smoothness_flatfield`` for the final fit.
@@ -118,6 +137,8 @@ def select_parameters(
         Per-tile spans into ``fit_slices``.
     args : argparse.Namespace
         Parsed command-line arguments.
+    basic_config : dict
+        BaSiC solver configuration every candidate is scored under.
 
     Returns
     -------
@@ -126,9 +147,10 @@ def select_parameters(
         report (None when no confirmation ran).
     """
     if args.skip_search:
-        logger.info("  Using manual params: %s", MANUAL_PARAMS)
+        configured = baseline_params(basic_config)
+        logger.info("  Using the configured params: %s", configured)
         return (
-            dict(MANUAL_PARAMS),
+            configured,
             {"reason": "skip_search_flag", "chose_baseline": True},
             None,
         )
@@ -136,7 +158,7 @@ def select_parameters(
     # Parallel autotune, faster than basicpy serial search
     params, report = parallel_autotune(
         images=fit_slices,
-        base_config=BASIC_CONFIG,
+        base_config=basic_config,
         tile_z_offsets=z_offsets,
         max_eval_slices=args.max_eval_slices,
         max_search_minutes=args.max_search_minutes,
@@ -145,7 +167,7 @@ def select_parameters(
     if not report.get("chose_baseline") and args.n_confirm > 0:
         params, confirm = confirm_against_baseline(
             fit_slices,
-            BASIC_CONFIG,
+            basic_config,
             params,
             tile_z_offsets=z_offsets,
             n_confirm=args.n_confirm,
@@ -196,6 +218,7 @@ def fit_with_guard(
     method: str,
     params: dict[str, float],
     baseline_std: float | None,
+    basic_config: dict[str, Any],
 ) -> FitResult:
     """
     Run the final fit and fall back to manual params if it looks wrong.
@@ -212,6 +235,8 @@ def fit_with_guard(
         Parameters chosen by the search.
     baseline_std : float or None
         Standard deviation of the baseline fit, for the relative floor.
+    basic_config : dict
+        BaSiC solver configuration the chosen parameters overlay.
 
     Returns
     -------
@@ -221,22 +246,24 @@ def fit_with_guard(
     """
     started = time.monotonic()
     flatfield, darkfield, n_z_ok = _run_fit(
-        fit_slices, stack, method, {**BASIC_CONFIG, **params}
+        fit_slices, stack, method, {**basic_config, **params}
     )
     logger.info("  Fit took %.1f min", (time.monotonic() - started) / 60.0)
     ok, stats, reasons = report_flatfield(flatfield, baseline_std)
 
-    if not ok and params != dict(MANUAL_PARAMS):
+    configured = baseline_params(basic_config)
+    if not ok and params != configured:
         logger.warning(
-            "  Refitting with manual params after the failed "
-            "plausibility check"
+            "  Refitting with the configured params %s after the failed "
+            "plausibility check",
+            configured,
         )
-        params = dict(MANUAL_PARAMS)
+        params = configured
         flatfield, darkfield, n_z_ok = _run_fit(
-            fit_slices, stack, method, {**BASIC_CONFIG, **MANUAL_PARAMS}
+            fit_slices, stack, method, {**basic_config, **configured}
         )
         ok, stats, reasons = report_flatfield(
-            flatfield, None, "(manual refit)"
+            flatfield, None, "(configured refit)"
         )
     if not ok:
         logger.warning(
@@ -308,6 +335,7 @@ def estimate_dataset(
     dark: np.ndarray | float,
     args: argparse.Namespace,
     output_folder: Path,
+    basic_config: dict[str, Any],
 ) -> dict[str, Any]:
     """
     Estimate and save one flatfield from a folder of tiles.
@@ -324,6 +352,8 @@ def estimate_dataset(
         Parsed command-line arguments.
     output_folder : Path
         Folder the flatfield, darkfield and sidecar are written to.
+    basic_config : dict
+        BaSiC solver configuration for this run.
 
     Returns
     -------
@@ -344,7 +374,7 @@ def estimate_dataset(
     fit_slices, pedestal = subtract_pedestal(stack.slices, dark_plane)
 
     params, search_report, confirm = select_parameters(
-        fit_slices, stack.z_offsets, args
+        fit_slices, stack.z_offsets, args, basic_config
     )
     result = fit_with_guard(
         fit_slices,
@@ -352,6 +382,7 @@ def estimate_dataset(
         args.method,
         params,
         (search_report or {}).get("baseline_std"),
+        basic_config,
     )
 
     validation = _write_products(
@@ -363,7 +394,7 @@ def estimate_dataset(
         "base_path": args.base_path,
         "tile_pattern": args.tile_pattern,
         "params": result.params,
-        "basic_config": BASIC_CONFIG,
+        "basic_config": basic_config,
         "method": args.method,
         "search": search_report,
         "confirm": confirm,
@@ -509,6 +540,17 @@ def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
         "index across all tiles, combined with a pixelwise median.",
     )
     parser.add_argument(
+        "--basic-config",
+        type=str,
+        default=None,
+        help="BaSiC solver configuration, as a path to a JSON file or "
+        "an inline JSON object. Merged over the built-in known-good "
+        "defaults, so only the keys being changed need to be given. "
+        "smoothness_flatfield is the parameter the search varies: the "
+        "value given here is the incumbent it must beat, and the value "
+        "fitted directly under --skip-search.",
+    )
+    parser.add_argument(
         "--max-fit-planes",
         type=int,
         default=2000,
@@ -616,13 +658,20 @@ def main(argv: list[str] | None = None) -> None:
     output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
+    # Resolved and checked before anything expensive: an unusable
+    # solver configuration should not surface after a long tile load.
+    basic_config = load_basic_config(args.basic_config)
+    validate_basic_config(basic_config)
+
     pattern = re.compile(args.tile_pattern) if args.tile_pattern else None
     tile_names = list_tiles(args.base_path, pattern)
     label = args.output_name or default_label(args.base_path)
     logger.info("Found %d tiles | output name: %s", len(tile_names), label)
 
     dark = load_darkfield(args.darkfield_image, args.darkfield_value)
-    estimate_dataset(label, tile_names, dark, args, output_folder)
+    estimate_dataset(
+        label, tile_names, dark, args, output_folder, basic_config
+    )
 
     logger.info(
         "Ending BaSiC flatfield estimation with outputs at: %s",

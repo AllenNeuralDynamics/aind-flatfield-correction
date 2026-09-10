@@ -1,6 +1,7 @@
 """Tests for the flatfield correction metrics."""
 
 import unittest
+import warnings
 
 import numpy as np
 
@@ -45,9 +46,12 @@ class TestMaskedProfile(unittest.TestCase):
     def test_ignores_empty_positions(self):
         """Padding zeros would drag the mean towards zero."""
         image = np.array([[100.0, 0.0], [200.0, 0.0]])
-        np.testing.assert_array_equal(
-            masked_profile(image, 0), [150.0, np.nan]
-        )
+        with warnings.catch_warnings():
+            # The fully masked column is the point of the test; numpy
+            # warns about the mean of an empty slice.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            profile = masked_profile(image, 0)
+        np.testing.assert_array_equal(profile, [150.0, np.nan])
 
     def test_averages_along_the_requested_axis(self):
         """Axis 0 gives the X profile, axis 1 the Y profile."""
@@ -58,5 +62,9 @@ class TestMaskedProfile(unittest.TestCase):
     def test_an_all_empty_row_is_not_a_number(self):
         """A grid position with no tile contributes nothing."""
         image = np.zeros((2, 2))
-        profile = masked_profile(image, 0)
+        with warnings.catch_warnings():
+            # numpy warns about the mean of an empty slice; a fully
+            # masked profile returning NaN is the intended behaviour.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            profile = masked_profile(image, 0)
         self.assertTrue(np.all(np.isnan(profile)))
