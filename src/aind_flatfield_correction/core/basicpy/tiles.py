@@ -334,17 +334,31 @@ def load_darkfield(
     """
     Resolve the darkfield camera offset from the command-line arguments.
 
+    A darkfield saved as a stack of dark frames is reduced to one plane
+    by averaging over the leading axes, which is how such a stack is
+    meant to be combined: averaging N dark exposures is what suppresses
+    read noise and leaves the fixed pedestal.  Only a 2-D plane can be
+    subtracted from the fitting stack or resized to the estimation
+    level.
+
     Parameters
     ----------
     darkfield_image : str or None
-        Path to a ``.npy`` darkfield image. Takes precedence.
+        Path to a ``.npy``, ``.tif`` or ``.tiff`` darkfield image.
+        Takes precedence over ``darkfield_value``.
     darkfield_value : float
         Scalar pedestal in ADU counts, used when no image is given.
 
     Returns
     -------
     np.ndarray or float
-        A 2-D/3-D darkfield image, or the scalar pedestal.
+        A 2-D darkfield plane, or the scalar pedestal.
+
+    Raises
+    ------
+    Exception
+        Whatever the reader raised, after logging the path; a darkfield
+        that cannot be read must not silently become a no-op.
     """
     if darkfield_image:
         try:
@@ -362,13 +376,15 @@ def load_darkfield(
             )
             raise
 
+        if dark.ndim > 2:
+            dark = dark.mean(axis=tuple(range(dark.ndim - 2)))
         logger.info(
             "  Darkfield image %s: shape=%s mean=%.2f",
             darkfield_image,
             dark.shape,
             float(dark.mean()),
         )
-        return dark
+        return np.asarray(dark, dtype=np.float32)
     return float(darkfield_value)
 
 

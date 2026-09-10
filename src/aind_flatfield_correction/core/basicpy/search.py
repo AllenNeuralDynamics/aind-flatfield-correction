@@ -77,7 +77,8 @@ def basic_entropy(
     )
     width = float(edges[1] - edges[0])
     prob_density = prob_density[prob_density > 0]
-    if prob_density.size == 0:
+    if prob_density.size == 0:  # pragma: no cover - defensive
+        # Unreachable: a non-empty in-range sample always fills a bin.
         return float("inf")
     entropy = float(-np.sum(prob_density * np.log(prob_density)) * width)
     return entropy if np.isfinite(entropy) else float("inf")
