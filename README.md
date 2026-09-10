@@ -22,9 +22,12 @@ We estimate the flatfields by smartly selecting slices from each tile in the dat
 
 This is the result after applying flatfield to the tiles of a proteomics dataset.
 ![Example Flatfield](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/flatfield_corrected.png?raw=true)
+![Example Flatfield Distribution](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/plot_distribution.png?raw=true)
 
 In very low illumination datasets and lower wavelenght channels, we can even detect the difference in the intensity gains of the camera chips.
 ![Two Difference Gain](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/two_gain_difference.png?raw=true)
+
+> **Note:** Technically speaking, we don't want to use the same darkfield for each side of the intensity gain, but this is good enough as an approximation and scientists as happy with the results.
 
 ## Installation
 
@@ -158,6 +161,13 @@ failed fit falls back to, and — with `--skip-search` — the value fitted dire
 
 The configuration is validated against BaSiC before any tile is read, so a mistyped key
 fails immediately instead of after a long load.
+
+## Parallel Grid Search
+We parallelized the grid search by using a shared memory compartment and maximizing the usage of the CPU cores with JAX. This is necessary as some parameters might be hard to estimate for every dataset, experiments and sequential exploration of parameters is extremely slow.
+
+Here we show an example of using this package with another dataset, specifically a hybridization chain reaction dataset.
+
+![HCR dataset](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/hcr_dataset.png?raw=true)
 
 ## Reviewing a flatfield
 
