@@ -467,7 +467,7 @@ def probe_plane_shape(
     Read one tile's plane extent at ``level`` from its metadata.
 
     Only the array's shape is touched, so this costs a metadata read
-    and fetches no voxels. 
+    and fetches no voxels.
 
     Parameters
     ----------

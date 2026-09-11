@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "aind-flatfield-correction"
 description = "Package for flatfield correction in microscopic images"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.12"
 authors = [
     {name = "Allen Institute for Neural Dynamics"}
 ]
@@ -29,9 +29,11 @@ dependencies = [
     "jax==0.4.23",
     "jaxlib==0.4.23",
     "zarr==2.18.2",
+    "numcodecs<0.16",
     "natsort==8.4.0",
     "hyperactive==4.6.0",
     "gradient-free-optimizers<1.9.0",
+    "aind-large-scale-prediction @ git+https://github.com/AllenNeuralDynamics/aind-large-scale-prediction.git@unpinned-versions",
 ]
 
 [dependency-groups]

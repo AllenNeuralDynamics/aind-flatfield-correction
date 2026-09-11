@@ -1,6 +1,7 @@
 """Tests for run provenance and log capture."""
 
 import argparse
+import io
 import logging
 import subprocess
 import tempfile
@@ -216,18 +217,30 @@ class TestRunLog(unittest.TestCase):
 
     def test_captures_records_from_any_logger(self):
         """Third-party warnings are what explain a non-obvious failure."""
+        root = logging.getLogger()
+        original = root.level
+        saved = list(root.handlers)
+        for existing in saved:
+            root.removeHandler(existing)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "estimation.log"
             handler = provenance.attach_run_log(path)
             try:
                 logging.disable(logging.NOTSET)
+                # attach_run_log inherits the configuration rather than
+                # imposing one, so the caller's level is what decides
+                # whether an INFO record reaches the file.
+                root.setLevel(logging.INFO)
                 logging.getLogger("jax").warning("third party warning")
                 logging.getLogger("aind_flatfield_correction.core").info(
                     "ours"
                 )
             finally:
+                root.setLevel(original)
                 logging.disable(logging.CRITICAL)
                 provenance.detach_run_log(handler)
+                for existing in saved:
+                    root.addHandler(existing)
             written = path.read_text()
         self.assertIn("third party warning", written)
         self.assertIn("ours", written)
@@ -261,7 +274,7 @@ class TestRunLog(unittest.TestCase):
         saved = list(root.handlers)
         for existing in saved:
             root.removeHandler(existing)
-        configured = logging.StreamHandler()
+        configured = logging.StreamHandler(io.StringIO())
         configured.setFormatter(logging.Formatter("CUSTOM %(message)s"))
         root.addHandler(configured)
         try:

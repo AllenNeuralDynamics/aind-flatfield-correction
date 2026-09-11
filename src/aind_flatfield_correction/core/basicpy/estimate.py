@@ -99,6 +99,7 @@ METADATA_DIR = "metadata"
 
 RUN_LOG_NAME = "estimation.log"
 
+
 class FitResult(NamedTuple):
     """
     Outcome of the final fit, after the plausibility guard.
@@ -280,6 +281,7 @@ def fit_with_guard(
             "recording it as suspicious"
         )
     return FitResult(flatfield, darkfield, n_z_ok, params, ok, stats, reasons)
+
 
 def write_tile_manifest(
     label: str, output_folder: Path, stack: FitStack

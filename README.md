@@ -5,7 +5,7 @@
 [![semantic-release: angular](https://img.shields.io/badge/semantic--release-angular-e10079?logo=semantic-release)](https://github.com/semantic-release/semantic-release)
 ![Interrogate](https://img.shields.io/badge/interrogate-100.0%25-brightgreen)
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
-![Python](https://img.shields.io/badge/python->=3.10-blue?logo=python)
+![Python](https://img.shields.io/badge/python->=3.10,<3.12-blue?logo=python)
 
 Flatfield estimation for microscopy tile datasets, built on
 [BaSiCPy](https://github.com/peng-lab/BaSiCPy).
@@ -35,10 +35,14 @@ In very low illumination datasets and lower wavelenght channels, we can even det
 uv sync
 ```
 
-> **Note:** `aind-large-scale-prediction`, which provides the OME-Zarr reader, is not
-> declared in `pyproject.toml` — its published release pins a yanked `imagecodecs`
-> version that `uv` cannot resolve. Install it separately (from a GitHub release, or via
-> the Code Ocean environment) before running the estimator.
+Python 3.10 and 3.11 only. The upper bound comes from the pinned `numpy==1.24.2`, which
+ships no cp312 wheel, and from `jax==0.4.23` requiring `numpy>=1.26` on Python 3.12.
+
+> **Note:** `aind-large-scale-prediction`, which provides the OME-Zarr reader, is
+> installed from its `unpinned-versions` branch rather than from PyPI: the released 1.0.0
+> hard-pins `numpy==1.26.4` and `zarr==2.18.0`, both of which conflict with the versions
+> pinned here. The dependency is a direct git reference, so `uv sync` and
+> `pip install -e .` both pick it up.
 
 For development, `uv sync` already includes the dev group. Without `uv`:
 
