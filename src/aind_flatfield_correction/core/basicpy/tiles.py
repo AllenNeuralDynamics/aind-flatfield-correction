@@ -199,28 +199,46 @@ def open_tile(
     """
     uri = f"{base_path.rstrip('/')}/{name}"
     if zarr_version is None:
-        for zarr_version in ZARR_VERSIONS:
+        failures = []
+        for candidate in ZARR_VERSIONS:
             try:
                 reader = OMEZarrReader(
                     data_path=uri,
                     multiscale=str(level),
-                    zarr_version=zarr_version
+                    zarr_version=candidate,
                 )
                 break
-            except ValueError as e:
-                logger.error("Failed to open tile %s at %s: %s", name, uri, e)
+            except Exception as error:  # noqa: BLE001
+                failures.append(f"zarr {candidate}: {error}")
+                logger.debug(
+                    "  tile %s did not open as zarr %s: %s",
+                    name,
+                    candidate,
+                    error,
+                )
         else:
-            raise ValueError(f"Failed to open tile {name}")
+            logger.error(
+                "Failed to open tile %s at %s; tried %s",
+                name,
+                uri,
+                " | ".join(failures),
+            )
+            raise ValueError(
+                f"Failed to open tile {name} as any of "
+                f"{', '.join(ZARR_VERSIONS)}"
+            )
     else:
         try:
             reader = OMEZarrReader(
                 data_path=uri,
                 multiscale=str(level),
-                zarr_version=zarr_version
+                zarr_version=zarr_version,
             )
-        except ValueError as e:
-            logger.error("Failed to open tile %s at %s: %s", name, uri, e)
-            raise ValueError(f"Failed to open tile {name}")
+        except Exception as error:  # noqa: BLE001
+            logger.error("Failed to open tile %s at %s: %s", name, uri, error)
+            raise ValueError(
+                f"Failed to open tile {name} as zarr {zarr_version}"
+            ) from error
 
     arr = reader.as_dask_array()
     while arr.ndim > 3:
