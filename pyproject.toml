@@ -14,7 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3"
 ]
 readme = "README.md"
-version = "1.0.0"
+version = "1.0.1"
 
 dependencies = [
     "numpy==1.24.2",
