@@ -202,21 +202,25 @@ def open_tile(
         for zarr_version in ZARR_VERSIONS:
             try:
                 reader = OMEZarrReader(
-                    data_path=uri, multiscale=str(level), zarr_version=zarr_version
+                    data_path=uri,
+                    multiscale=str(level),
+                    zarr_version=zarr_version
                 )
                 break
             except ValueError as e:
                 logger.error("Failed to open tile %s at %s: %s", name, uri, e)
         else:
-            raise ValueError(f"Failed to open tile {name} at {uri} with any Zarr version")
+            raise ValueError(f"Failed to open tile {name}")
     else:
         try:
             reader = OMEZarrReader(
-                data_path=uri, multiscale=str(level), zarr_version=zarr_version
+                data_path=uri,
+                multiscale=str(level),
+                zarr_version=zarr_version
             )
         except ValueError as e:
             logger.error("Failed to open tile %s at %s: %s", name, uri, e)
-            raise ValueError(f"Failed to open tile {name} at {uri} with Zarr version {zarr_version}")
+            raise ValueError(f"Failed to open tile {name}")
 
     arr = reader.as_dask_array()
     while arr.ndim > 3:
