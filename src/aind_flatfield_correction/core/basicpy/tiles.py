@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import boto3
 import numpy as np
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # OME-NGFF orders its multiscale datasets from highest to lowest
 # resolution, so the first one is the full-resolution level.
 FULL_RESOLUTION_LEVEL = "0"
+ZARR_VERSIONS = ("2.0", "3.0")
 
 
 class TileRecord(NamedTuple):
@@ -169,7 +170,12 @@ def list_tiles(
     return tiles
 
 
-def open_tile(base_path: str, name: str, level: int | str):
+def open_tile(
+    base_path: str,
+    name: str,
+    level: int | str,
+    zarr_version: Optional[str] = None,
+):
     """
     Open one tile as a 3-D ``(Z, Y, X)`` dask array.
 
@@ -181,6 +187,9 @@ def open_tile(base_path: str, name: str, level: int | str):
         Tile directory name.
     level : int or str
         Multiscale (pyramid) level to read.
+    zarr_version : str, optional
+        Zarr format version to use. If ``None``, the function will try
+        both "3.0" and "2.0".
 
     Returns
     -------
@@ -189,9 +198,26 @@ def open_tile(base_path: str, name: str, level: int | str):
         dropped.
     """
     uri = f"{base_path.rstrip('/')}/{name}"
-    reader = OMEZarrReader(
-        data_path=uri, multiscale=str(level), zarr_version="3.0"
-    )
+    if zarr_version is None:
+        for zarr_version in ZARR_VERSIONS:
+            try:
+                reader = OMEZarrReader(
+                    data_path=uri, multiscale=str(level), zarr_version=zarr_version
+                )
+                break
+            except ValueError as e:
+                logger.error("Failed to open tile %s at %s: %s", name, uri, e)
+        else:
+            raise ValueError(f"Failed to open tile {name} at {uri} with any Zarr version")
+    else:
+        try:
+            reader = OMEZarrReader(
+                data_path=uri, multiscale=str(level), zarr_version=zarr_version
+            )
+        except ValueError as e:
+            logger.error("Failed to open tile %s at %s: %s", name, uri, e)
+            raise ValueError(f"Failed to open tile {name} at {uri} with Zarr version {zarr_version}")
+
     arr = reader.as_dask_array()
     while arr.ndim > 3:
         arr = arr[0]
