@@ -25,7 +25,7 @@ dependencies = [
     "matplotlib",
     "tifffile",
     "psutil",
-    "BaSiCPy==1.1.0",
+    "BaSiCPy==2.0.0",
     "jax==0.4.23",
     "jaxlib==0.4.23",
     "zarr==2.18.2",
