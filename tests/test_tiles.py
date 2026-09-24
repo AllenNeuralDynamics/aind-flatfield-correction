@@ -503,3 +503,46 @@ class TestSubtractPedestal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPlaneConcentration(unittest.TestCase):
+    """Measuring how unevenly the fit objective is spread across planes."""
+
+    def test_a_uniform_stack_spreads_its_objective_evenly(self):
+        """With every plane alike, the brightest few hold their fair share."""
+        slices = np.ones((280, 4, 5), dtype=np.float32)
+        info = tiles.plane_concentration(slices)
+        self.assertEqual(info["top_n"], 10)
+        self.assertEqual(info["n_planes"], 280)
+        self.assertAlmostEqual(info["top_share"], 10 / 280, places=6)
+        self.assertEqual(info["hot_planes"], 0)
+
+    def test_a_few_bright_planes_dominate(self):
+        """This is the injection-site signature the threshold keys on."""
+        slices = np.ones((280, 4, 5), dtype=np.float32)
+        slices[:10] *= 60.0
+        info = tiles.plane_concentration(slices)
+        self.assertGreater(info["top_share"], 0.5)
+        self.assertEqual(info["hot_planes"], 10)
+        self.assertAlmostEqual(info["plane_mean_ratio"], 60.0, places=4)
+
+    def test_hot_planes_are_counted_separately_from_the_share(self):
+        """Many mildly bright planes are not the same as a few dominant ones."""
+        slices = np.ones((280, 4, 5), dtype=np.float32)
+        slices[:44] *= 6.0
+        info = tiles.plane_concentration(slices)
+        self.assertEqual(info["hot_planes"], 44)
+        # 44 hot planes, yet the brightest 10 hold well under half.
+        self.assertLess(info["top_share"], 0.5)
+
+    def test_an_all_zero_stack_reports_nan_rather_than_dividing(self):
+        """A dead channel must not raise here."""
+        info = tiles.plane_concentration(np.zeros((8, 2, 2), dtype=np.float32))
+        self.assertTrue(np.isnan(info["top_share"]))
+        self.assertTrue(np.isnan(info["plane_mean_ratio"]))
+
+    def test_the_top_slice_is_at_least_one_plane(self):
+        """A tiny stack still has a brightest plane."""
+        info = tiles.plane_concentration(np.ones((3, 2, 2), dtype=np.float32))
+        self.assertEqual(info["top_n"], 1)
+        self.assertAlmostEqual(info["hot_fraction"], 0.0, places=6)

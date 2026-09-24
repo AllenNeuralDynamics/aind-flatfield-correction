@@ -990,3 +990,79 @@ class TestMain(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGuardFallbackIsRecorded(unittest.TestCase):
+    """The fallback refit must stay answerable to the relative floor."""
+
+    def test_a_clean_fit_is_not_marked_as_fallen_back(self):
+        """Nothing to record when the search's choice stands."""
+        stack = _stack()
+        with patch.object(
+            estimate,
+            "_run_fit",
+            return_value=(_plausible(), np.zeros((8, 8)), None),
+        ):
+            result = estimate.fit_with_guard(
+                stack.slices,
+                stack,
+                "fit",
+                {"smoothness_flatfield": 0.5},
+                None,
+                BASIC_CONFIG,
+            )
+        self.assertTrue(result.ok)
+        self.assertFalse(result.fell_back)
+
+    def test_the_fallback_is_recorded_when_it_happens(self):
+        """A substituted parameter set must be visible in the sidecar."""
+        stack = _stack()
+        outcomes = [
+            (np.ones((8, 8)), np.zeros((8, 8)), None),
+            (_plausible(), np.zeros((8, 8)), None),
+        ]
+        with patch.object(estimate, "_run_fit", side_effect=outcomes):
+            result = estimate.fit_with_guard(
+                stack.slices,
+                stack,
+                "fit",
+                {"smoothness_flatfield": 0.5},
+                None,
+                BASIC_CONFIG,
+            )
+        self.assertTrue(result.fell_back)
+        self.assertEqual(result.params, baseline_params(BASIC_CONFIG))
+
+    def test_the_fallback_is_still_judged_against_the_baseline_std(self):
+        """
+        Passing None here once disabled the relative floor on the fallback, so a
+        fallback that had merely inherited the baseline's contamination could
+        never be flagged. Both refits must see the same reference.
+        """
+        stack = _stack()
+        outcomes = [
+            (np.ones((8, 8)), np.zeros((8, 8)), None),
+            (_plausible(), np.zeros((8, 8)), None),
+        ]
+        stats = {"min": 1.0, "max": 1.0, "span": 0.0, "std": 0.0, "mean": 1.0}
+        verdicts = [(False, stats, ["implausible"]), (True, stats, [])]
+        seen = []
+
+        def _spy(flatfield, baseline_std=None, label=""):
+            """Record the reference each guard call was given."""
+            seen.append(baseline_std)
+            return verdicts[len(seen) - 1]
+
+        with patch.object(
+            estimate, "_run_fit", side_effect=outcomes
+        ), patch.object(estimate, "report_flatfield", side_effect=_spy):
+            result = estimate.fit_with_guard(
+                stack.slices,
+                stack,
+                "fit",
+                {"smoothness_flatfield": 0.5},
+                0.25,
+                BASIC_CONFIG,
+            )
+        self.assertEqual(seen, [0.25, 0.25])
+        self.assertTrue(result.fell_back)

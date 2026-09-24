@@ -84,6 +84,7 @@ from aind_flatfield_correction.core.basicpy.tiles import (
     match_darkfield,
     probe_plane_shape,
     resize_plane,
+    plane_concentration,
     subtract_pedestal,
 )
 from aind_flatfield_correction.provenance import (
@@ -119,6 +120,9 @@ class FitResult(NamedTuple):
         Summary statistics of the fit.
     reasons : list[str]
         Reasons for any plausibility check failures.
+    fell_back : bool
+        Whether the search's choice was rejected by the guard and the
+        configured parameters were refitted in its place.
     """
 
     flatfield: np.ndarray
@@ -128,6 +132,7 @@ class FitResult(NamedTuple):
     ok: bool
     stats: dict[str, float]
     reasons: list[str]
+    fell_back: bool = False
 
 
 def select_parameters(
@@ -261,6 +266,7 @@ def fit_with_guard(
     logger.info("  Fit took %.1f min", (time.monotonic() - started) / 60.0)
     ok, stats, reasons = report_flatfield(flatfield, baseline_std)
 
+    fell_back = False
     configured = baseline_params(basic_config)
     if not ok and params != configured:
         logger.warning(
@@ -269,18 +275,25 @@ def fit_with_guard(
             configured,
         )
         params = configured
+        fell_back = True
         flatfield, darkfield, n_z_ok = _run_fit(
             fit_slices, stack, method, {**basic_config, **configured}
         )
+        # Keep baseline_std in play. Passing None here disabled the relative
+        # floor on the fallback, so a fallback that had merely inherited the
+        # baseline's own contamination could never be flagged -- which is how
+        # an injection-contaminated flatfield once shipped as not suspicious.
         ok, stats, reasons = report_flatfield(
-            flatfield, None, "(configured refit)"
+            flatfield, baseline_std, "(configured refit)"
         )
     if not ok:
         logger.warning(
             "  !! flatfield still suspicious after the fallback - "
             "recording it as suspicious"
         )
-    return FitResult(flatfield, darkfield, n_z_ok, params, ok, stats, reasons)
+    return FitResult(
+        flatfield, darkfield, n_z_ok, params, ok, stats, reasons, fell_back
+    )
 
 
 def write_tile_manifest(
@@ -528,6 +541,15 @@ def estimate_dataset(
     dark_plane = match_darkfield(dark, (stack.height, stack.width))
     # Subtract the darkfield from the stack slices to estimate the flat
     fit_slices, pedestal = subtract_pedestal(stack.slices, dark_plane)
+    concentration = plane_concentration(fit_slices)
+    logger.info(
+        "  Plane concentration: top %d of %d planes hold %.1f%% of the "
+        "objective (%d planes above 5x the median)",
+        concentration["top_n"],
+        concentration["n_planes"],
+        100.0 * concentration["top_share"],
+        concentration["hot_planes"],
+    )
 
     params, search_report, confirm = select_parameters(
         fit_slices, stack.z_offsets, args, basic_config
@@ -567,7 +589,11 @@ def estimate_dataset(
         "search": search_report,
         "confirm": confirm,
         "flatfield_stats": result.stats,
-        "guard": {"ok": bool(result.ok), "reasons": result.reasons},
+        "guard": {
+            "ok": bool(result.ok),
+            "reasons": result.reasons,
+            "fell_back": bool(result.fell_back),
+        },
         "suspicious": (not result.ok),
         "n_tiles": len(tile_names),
         "planes_per_tile": int(stack.n_planes),
@@ -580,6 +606,7 @@ def estimate_dataset(
         ),
         "darkfield_mean": float(dark_plane.mean()),
         "pedestal": pedestal,
+        "concentration": concentration,
         "n_z_fits_ok": result.n_z_fits_ok,
         "validation": validation,
         "upsampled": upsampled,

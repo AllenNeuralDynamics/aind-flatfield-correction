@@ -611,3 +611,64 @@ def subtract_pedestal(
         info["dilution_if_fitted_on_raw"],
     )
     return fit_slices, info
+
+
+def plane_concentration(
+    fit_slices: np.ndarray, hot_ratio: float = 5.0
+) -> dict[str, float]:
+    """
+    Measure how unevenly the fit objective is spread across planes.
+
+    BaSiC minimises a squared error weighted by absolute intensity, so a few
+    very bright planes -- a tracer injection site, say -- can carry most of the
+    objective and pull the flatfield towards their own content. This reports
+    that imbalance so a caller can refuse the fit rather than trust it.
+
+    Measured over three SmartSPIM acquisitions: healthy channels scored 0.144
+    to 0.330, injection-contaminated ones 0.590 to 0.632. The figure is stable
+    against the plane budget -- the same channel read 0.594 at 280 planes and
+    0.577 at 1988.
+
+    ``hot_fraction`` is reported separately and is *not* a substitute for
+    ``top_share``: one healthy channel held 44 planes above the ratio while
+    scoring only 0.199, because those planes were moderately bright rather
+    than dominant.
+
+    Parameters
+    ----------
+    fit_slices : np.ndarray
+        Pedestal-subtracted ``(N, H, W)`` fitting stack.
+    hot_ratio : float, optional
+        Multiple of the median plane mean above which a plane counts as hot,
+        by default 5.0.
+
+    Returns
+    -------
+    dict
+        ``top_share`` (fraction of the total sum-of-squares held by the
+        brightest 3.6% of planes), ``top_n`` (how many planes that is),
+        ``hot_fraction``, ``hot_planes`` and ``plane_mean_ratio`` (brightest
+        plane mean over the median).
+    """
+    energy = (np.asarray(fit_slices, dtype=np.float64) ** 2).sum(axis=(1, 2))
+    total = float(energy.sum())
+    n_planes = int(energy.size)
+    # 10 of 280 was the reference proportion these thresholds were measured at.
+    top_n = max(1, round(n_planes * 10 / 280))
+    ranked = np.sort(energy)[::-1]
+    top_share = float(ranked[:top_n].sum() / total) if total else float("nan")
+
+    plane_means = np.asarray(fit_slices, dtype=np.float64).mean(axis=(1, 2))
+    median_mean = float(np.median(plane_means))
+    hot = plane_means > hot_ratio * median_mean
+
+    return {
+        "top_share": top_share,
+        "top_n": top_n,
+        "n_planes": n_planes,
+        "hot_planes": int(hot.sum()),
+        "hot_fraction": float(hot.mean()),
+        "plane_mean_ratio": (
+            float(plane_means.max() / median_mean) if median_mean else float("nan")
+        ),
+    }
