@@ -528,9 +528,11 @@ class TestEstimateDataset(unittest.TestCase):
             [
                 "darkfield_ch_405.npy",
                 "darkfield_ch_405_level0.npy",
+                "darkfield_ch_405_level0.png",
                 "flatfield_ch_405.json",
                 "flatfield_ch_405.npy",
                 "flatfield_ch_405_level0.npy",
+                "flatfield_ch_405_level0.png",
                 "metadata",
             ],
         )
