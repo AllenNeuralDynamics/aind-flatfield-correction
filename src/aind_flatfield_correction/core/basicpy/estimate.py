@@ -56,6 +56,8 @@ import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from matplotlib.image import imsave
+
 import numpy as np
 
 from aind_flatfield_correction.core.basicpy.config import (
@@ -401,10 +403,18 @@ def upsample_to_full_resolution(
     flat_full = resize_plane(flatfield, shape)
     flat_path = output_folder / f"flatfield_{label}{suffix}"
     np.save(flat_path, flat_full)
+    imsave(
+        flat_path.with_suffix(".png"),
+        flat_full,
+        cmap="coolwarm",
+        vmin=0.4,
+        vmax=1.6,
+    )
 
     dark_full = match_darkfield(dark, shape)
     dark_path = output_folder / f"darkfield_{label}{suffix}"
     np.save(dark_path, dark_full)
+    imsave(dark_path.with_suffix(".png"), dark_full, cmap="gray")
 
     factor = shape[0] / flatfield.shape[0] if flatfield.shape[0] else None
     logger.info(
