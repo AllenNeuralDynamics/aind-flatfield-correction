@@ -27,7 +27,7 @@ dependencies = [
     "psutil",
     "BaSiCPy==1.1.0",
     "jax==0.4.23",
-    "jaxlib==0.4.23",
+    "jaxlib==0.6.2",
     "zarr==2.18.2",
     "numcodecs<0.16",
     "natsort==8.4.0",
