@@ -31,7 +31,7 @@ dependencies = [
     "zarr==2.18.2",
     "numcodecs<0.16",
     "natsort==8.4.0",
-    "hyperactive==4.6.0",
+    "hyperactive==5.0.4",
     "gradient-free-optimizers<1.9.0",
     "aind-large-scale-prediction @ git+https://github.com/AllenNeuralDynamics/aind-large-scale-prediction.git@unpinned-versions",
 ]
