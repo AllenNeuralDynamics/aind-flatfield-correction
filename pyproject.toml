@@ -26,7 +26,7 @@ dependencies = [
     "tifffile",
     "psutil",
     "BaSiCPy==1.1.0",
-    "jax==0.4.23",
+    "jax==0.6.2",
     "jaxlib==0.4.23",
     "zarr==2.18.2",
     "numcodecs<0.16",
