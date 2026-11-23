@@ -1,8 +1,10 @@
 """Tests for the inspection figures."""
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -216,6 +218,128 @@ class TestPlotFigures(unittest.TestCase):
                 out,
             )
             self.assertGreater(out.stat().st_size, 0)
+
+    def test_tile_profile_draws_the_change_panel(self):
+        """The fifth panel is where a dimmed tile centre shows up."""
+        stack, flatfield, dark = _vignetted_stack()
+        plane = figures._display_plane(stack, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                figures,
+                "_plot_change_profile",
+                wraps=figures._plot_change_profile,
+            ) as panel:
+                figures._plot_tile_profile(
+                    "ch_405",
+                    TILE_NAMES[1],
+                    plane,
+                    figures.correct_slice(plane, flatfield, dark),
+                    dark,
+                    Path(tmp) / "tile.png",
+                )
+        panel.assert_called_once()
+
+
+class TestSignalChangeProfile(unittest.TestCase):
+    """The percent change the correction applies by position."""
+
+    def test_is_the_gain_where_there_is_signal(self):
+        """Corrected over raw, as a percent change."""
+        change = figures.signal_change_profile(
+            np.array([100.0, 200.0, 50.0]), np.array([150.0, 200.0, 40.0])
+        )
+        np.testing.assert_allclose(change, [50.0, 0.0, -20.0])
+
+    def test_marks_positions_without_signal(self):
+        """No signal above the darkfield has no meaningful ratio."""
+        change = figures.signal_change_profile(
+            np.array([0.0, 100.0]), np.array([0.0, 80.0])
+        )
+        self.assertTrue(np.isnan(change[0]))
+        self.assertAlmostEqual(change[1], -20.0)
+
+
+class TestPlotChangeProfile(unittest.TestCase):
+    """The panel drawing the change in signal by position."""
+
+    def _draw(self, raw_profile, corrected):
+        """
+        Draw the panel on a fresh axis.
+
+        Parameters
+        ----------
+        raw_profile : np.ndarray
+            Pedestal-subtracted raw plane.
+        corrected : np.ndarray
+            Corrected plane.
+
+        Returns
+        -------
+        tuple of (list of str, int)
+            The legend entries and the number of red regions drawn.
+        """
+        plt = figures._get_pyplot()
+        fig, axis = plt.subplots()
+        try:
+            figures._plot_change_profile(axis, raw_profile, corrected)
+            texts = [t.get_text() for t in axis.get_legend().get_texts()]
+            red = sum(len(c.get_paths()) for c in axis.collections)
+        finally:
+            plt.close(fig)
+        return texts, red
+
+    def _planes(self, flatfield):
+        """
+        Correct one vignetted plane with the given flatfield.
+
+        Parameters
+        ----------
+        flatfield : np.ndarray
+            Flatfield to divide by.
+
+        Returns
+        -------
+        tuple of (np.ndarray, np.ndarray)
+            The pedestal-subtracted raw plane and the corrected plane.
+        """
+        stack, _, dark = _vignetted_stack()
+        plane = figures._display_plane(stack, 0)
+        raw_profile = np.clip(plane - dark, 0.0, None)
+        return raw_profile, figures.correct_slice(plane, flatfield, dark)
+
+    def test_draws_one_curve_per_axis_with_its_range(self):
+        """Top-bottom and left-right, each with its smallest and largest.
+
+        Each point averages a whole row or column, which still holds the
+        boosted edges, so even a flat peaking at 1 never reaches 0%.
+        """
+        _, flatfield, _ = _vignetted_stack()
+        texts, _ = self._draw(*self._planes(flatfield))
+        self.assertEqual(len(texts), 2)
+        for text, name in zip(texts, ("top → bottom", "left → right")):
+            found = re.fullmatch(rf"{name}: \+(\d+)% to \+(\d+)%", text)
+            self.assertIsNotNone(found, text)
+            self.assertLess(int(found.group(1)), int(found.group(2)))
+
+    def test_a_flat_that_only_brightens_shades_nothing(self):
+        """Peak of 1, as the scaling saves it: no signal is lost."""
+        _, flatfield, _ = _vignetted_stack()
+        _, red = self._draw(*self._planes(flatfield))
+        self.assertEqual(red, 0)
+
+    def test_shades_the_signal_a_mean_one_flat_loses(self):
+        """A mean-1 field dims the bright centre: shown in red."""
+        _, flatfield, _ = _vignetted_stack()
+        texts, red = self._draw(*self._planes(flatfield / flatfield.mean()))
+        self.assertGreater(red, 0)
+        self.assertIn(": -", texts[0])
+
+    def test_reports_a_tile_without_signal(self):
+        """Nothing above the darkfield: say so rather than print NaN."""
+        empty = np.zeros((16, 16), dtype=np.float32)
+        texts, red = self._draw(empty, empty)
+        self.assertTrue(all("no signal" in text for text in texts))
+        self.assertEqual(red, 0)
 
 
 class TestSaveValidationFigures(unittest.TestCase):

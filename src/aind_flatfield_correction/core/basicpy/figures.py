@@ -201,6 +201,97 @@ def _plot_profile_pair(
     axis.grid(True, alpha=0.3)
 
 
+def signal_change_profile(
+    before: np.ndarray, after: np.ndarray
+) -> np.ndarray:
+    """
+    Percent change the correction applies at each position of a profile.
+
+    The ratio of the corrected profile to the pedestal-subtracted raw one
+    is the gain averaged over that row or column, weighted by the tile's
+    own signal, so it shows where the correction brightens or dims the
+    data and by how much.
+
+    Parameters
+    ----------
+    before : np.ndarray
+        Pedestal-subtracted raw profile.
+    after : np.ndarray
+        Corrected profile.
+
+    Returns
+    -------
+    np.ndarray
+        ``100 * (after / before - 1)``, NaN wherever ``before`` holds no
+        signal.
+    """
+    before = np.asarray(before, dtype=np.float64)
+    after = np.asarray(after, dtype=np.float64)
+    ratio = np.divide(
+        after, before, out=np.full(before.shape, np.nan), where=before > 0
+    )
+    return 100.0 * (ratio - 1.0)
+
+
+def _plot_change_profile(
+    axis, raw_profile: np.ndarray, corrected: np.ndarray
+) -> None:
+    """
+    Draw the percent change in signal by position, along both axes.
+
+    Both curves share an edge-centre-edge axis, and signal lost is shaded
+    red: a mean-1 flatfield dims the bright centre of the tile, and this
+    panel is where that shows up.
+
+    Parameters
+    ----------
+    axis : matplotlib.axes.Axes
+        Axis to draw on.
+    raw_profile : np.ndarray
+        Pedestal-subtracted raw plane.
+    corrected : np.ndarray
+        Corrected plane.
+
+    Returns
+    -------
+    None
+    """
+    for along, name, colour in (
+        (1, "top → bottom", "#2a78d6"),
+        (0, "left → right", "#eb6834"),
+    ):
+        change = signal_change_profile(
+            raw_profile.mean(axis=along), corrected.mean(axis=along)
+        )
+        finite = np.isfinite(change)
+        if finite.any():
+            label = (
+                f"{name}: {change[finite].min():+.0f}% to "
+                f"{change[finite].max():+.0f}%"
+            )
+        else:
+            label = f"{name}: no signal above the darkfield"
+        position = np.linspace(0.0, 1.0, change.size)
+        axis.plot(position, change, color=colour, linewidth=2.0, label=label)
+        axis.fill_between(
+            position,
+            change,
+            0.0,
+            where=np.nan_to_num(change) < 0,
+            color="#d03b3b",
+            alpha=0.25,
+            interpolate=True,
+        )
+    low, high = axis.get_ylim()
+    axis.set_ylim(min(low, -5.0), max(high, 5.0))
+    axis.axhline(0.0, color="#333333", linewidth=0.8)
+    axis.set_xticks([0.0, 0.5, 1.0], ["edge", "centre", "edge"])
+    axis.set_ylabel("Change in signal (%)")
+    axis.set_title("Change in signal by position (red = lost)")
+    axis.legend(fontsize=8)
+    axis.grid(True, alpha=0.3)
+
+
 def _plot_overview(
     label: str,
     flatfield: np.ndarray,
@@ -269,12 +360,14 @@ def _plot_tile_profile(
     out_path: Path,
 ) -> None:
     """
-    Save the raw / X profile / Y profile / corrected panel for one tile.
+    Save the raw / X profile / Y profile / corrected / change panels.
 
     The profile curves compare pedestal-subtracted raw against corrected
     values: the correction removes the offset, so plotting true raw
     against it would shift the curves apart and hide whether the
-    vignetting was actually flattened.
+    vignetting was actually flattened.  The last panel is the ratio of
+    those two curves, as a percent change by position, so a correction
+    that dims part of the tile shows up as a red region.
 
     Parameters
     ----------
@@ -297,7 +390,7 @@ def _plot_tile_profile(
     """
     plt = _get_pyplot()
     raw_profile = np.clip(plane - dark_plane, 0.0, None)
-    fig, axs = plt.subplots(1, 4, figsize=(20, 4))
+    fig, axs = plt.subplots(1, 5, figsize=(25, 4))
     fig.suptitle(f"{label}  {tile_name}", fontsize=11)
 
     vmin, vmax = _display_range(plane)
@@ -328,6 +421,8 @@ def _plot_tile_profile(
     )
     axs[3].set_title("Corrected")
     axs[3].axis("off")
+
+    _plot_change_profile(axs[4], raw_profile, corrected)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
