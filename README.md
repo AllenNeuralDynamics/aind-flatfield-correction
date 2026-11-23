@@ -154,7 +154,13 @@ estimation.
    it computes `(raw − dark) · c / flatfield`. The vignetting shape, and so the flatness
    of the result, is unchanged, but only 0.1% of pixels keep a gain below 1 — by 0.3–0.6%
    on smooth flats, more when the flat has a long upper tail (−10.7% on one SmartSPIM 561 nm
-   flat whose 99.9th percentile was 1.37 and maximum 1.54). The guard and `flatfield_stats` still describe the mean-1 field
+   flat whose 99.9th percentile was 1.37 and maximum 1.54). The price is that everything
+   below the flat's peak is brightened, the tile centre included, since flats rarely
+   have a broad flat top: the median pixel gained +8% to +34% on the SmartSPIM and HCR
+   flats checked. It is one factor per channel, so relative intensities and stitching are
+   unaffected, but corrected values sit above raw. A lower `--scale-percentile` keeps the
+   centre closer to raw by dimming the pixels above that percentile — the compression
+   this step removes. The guard and `flatfield_stats` still describe the mean-1 field
    their thresholds assume; the sidecar's `scaling` block records `c`, the fraction of
    pixels still dimmed, and the largest reduction and boost. A field with non-finite or
    non-positive values cannot be scaled and is saved as fitted, with the reason recorded.
@@ -235,9 +241,15 @@ acquisition grid:
   fitted plane, before and after correction, with the coefficient of variation of each.
   A correct flatfield lowers it.
 - `<name>_tile<NNN>_<tile>.png` — per-tile panels for `--validate-tiles` tiles spread
-  across the list: raw, X profile, Y profile, corrected. The raw curve should be bowed by
-  vignetting and the corrected one flat. **This is the acceptance gate** — review these
-  before applying a flatfield to a whole dataset.
+  across the list: raw, X profile, Y profile, corrected, and the change in signal by
+  position. The raw curve should be bowed by vignetting and the corrected one flat.
+  The last panel is the ratio of those two curves as a percent change, top → bottom and
+  left → right, with signal lost shaded red: with the default scaling it stays above 0,
+  while a mean-1 flatfield (`--no-scale-flatfield`) shows the dimmed tile centre in red.
+  Each point averages a whole row or column, so it shows the typical change at that
+  position rather than the worst pixel, which the sidecar's `scaling` block records.
+  **This is the acceptance gate** — review these before applying a flatfield to a whole
+  dataset.
 
 Profiles average occupied pixels only; tiles smaller than the padded plane leave zeros
 that would otherwise flatten the curves.
