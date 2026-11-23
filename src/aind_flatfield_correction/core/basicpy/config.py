@@ -45,6 +45,17 @@ FF_SPAN_FLOOR = 0.100
 FF_STD_CEILING = 0.50
 FF_REL_FLOOR = 0.60
 
+# Percentile of the accepted flatfield that is rescaled to 1.0 before it
+# is saved.  Dividing by basicpy's mean-1 flatfield dims every pixel
+# brighter than the mean -- the tile centre, by 9-24% on SmartSPIM and
+# HCR data -- and so compresses the signal.  With the 99.9th percentile
+# at 1.0, only 0.1% of pixels keep a gain below 1, by about 1% or less
+# on smooth flats; everywhere else the correction only brightens.  The
+# record written by ``fit.scale_flatfield`` reports the actual worst
+# case, which a flat with a long upper tail raises.  The guard runs
+# before the rescaling, on the mean-1 field its thresholds assume.
+FLAT_SCALE_PERCENTILE = 99.9
+
 # Seeds for the two subsamples the search draws.  Named so that a run
 # can record them rather than duplicating the literals.
 SUBSAMPLE_SEED = 42

@@ -82,11 +82,11 @@ Named after `--output-name`, or after the last segment of `base_path` if you omi
 
 | Path | Contents |
 |---|---|
-| `flatfield_<name>.npy` | The fitted flatfield, at the estimation pyramid level |
+| `flatfield_<name>.npy` | The fitted flatfield, at the estimation pyramid level, scaled so its 99.9th percentile is 1 (see step 6 below) |
 | `flatfield_<name>_level0.npy` | The same flatfield resampled to full resolution, unless `--no-upsample` |
 | `darkfield_<name>.npy` | The darkfield plane that was actually subtracted before fitting |
 | `darkfield_<name>_level0.npy` | The darkfield at full resolution, unless `--no-upsample` |
-| `flatfield_<name>.json` | Sidecar: solver config, chosen parameters, search report, flatfield statistics, the plausibility verdict, provenance, and the list of tiles used |
+| `flatfield_<name>.json` | Sidecar: solver config, chosen parameters, search report, flatfield statistics, the plausibility verdict, the scaling applied, provenance, and the list of tiles used |
 | `metadata/estimation.log` | The whole run's log |
 | `metadata/tiles_<name>.json` | One record per tile that contributed to the fit |
 | `<name>/*.png` | Inspection figures, only with `--validate` |
@@ -147,8 +147,24 @@ estimation.
    span. basicpy normalizes the flatfield mean to 1.0, so those thresholds are scale-free.
    A field that fails is refitted with the configured baseline; if it still fails, the run
    records it as `"suspicious": true` rather than passing it off as good.
+6. **Scale so the correction does not compress the signal.** An apply step divides by the
+   flatfield, and dividing by a mean-1 field dims every pixel brighter than the mean — the
+   bright centre of the tile, by 9–24% on SmartSPIM and HCR data — while only the edges
+   gain. The accepted field is therefore divided by its 99.9th percentile `c`, so applying
+   it computes `(raw − dark) · c / flatfield`. The vignetting shape, and so the flatness
+   of the result, is unchanged, but only 0.1% of pixels keep a gain below 1 — by 0.3–0.6%
+   on smooth flats, more when the flat has a long upper tail (−10.7% on one SmartSPIM 561 nm
+   flat whose 99.9th percentile was 1.37 and maximum 1.54). The guard and `flatfield_stats` still describe the mean-1 field
+   their thresholds assume; the sidecar's `scaling` block records `c`, the fraction of
+   pixels still dimmed, and the largest reduction and boost. A field with non-finite or
+   non-positive values cannot be scaled and is saved as fitted, with the reason recorded.
+   On by default; keep the mean-1 field with `--no-scale-flatfield`. The boost raises the
+   brightest voxels too, so a channel already near 65535 saturates more after the apply
+   step: on a SmartSPIM 561 nm tile that saturates in raw, voxels clipped at 65535 by the
+   correction went from 8.5 M to 43.7 M (0.34% of the tile); channels well below 65535
+   saw none.
 
-6. **Upsample to full resolution.** The fit runs on a downsampled level for speed, but
+7. **Upsample to full resolution.** The fit runs on a downsampled level for speed, but
    the correction is applied to full-resolution voxels, so both fields are resampled up to
    the extent the dataset's own metadata reports for its highest-resolution level. On by default; turn it off with
    `--no-upsample`.
@@ -171,6 +187,8 @@ configuration you supplied.
 | `--method` | `fit` | `fit` is one joint fit; `per-z-median` fits each Z index across all tiles and takes the pixelwise median |
 | `--basic-config` | built-in | Solver configuration; see below |
 | `--upsample` / `--no-upsample` | on | Also save both fields resampled to the full-resolution level |
+| `--scale-flatfield` / `--no-scale-flatfield` | on | Save the flatfield with its `--scale-percentile` at 1 instead of its mean, so the correction does not dim the tile centre |
+| `--scale-percentile` | `99.9` | Percentile mapped to 1 by the scaling, in (0, 100] |
 | `--max-fit-planes` | `2000` | Image budget across all tiles |
 | `--validate` | off | Write the inspection figures |
 | `--validate-tiles` | `4` | How many tiles get a profile figure |
