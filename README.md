@@ -99,7 +99,9 @@ Supply a measured darkfield; do not turn `get_darkfield` on to let BaSiC estimat
 dim HCR channels and on SmartSPIM channels BaSiC's own darkfield came out at 0–6 counts
 against a measured camera dark of 90–104, both with the built-in configuration and with
 basicpy's defaults: BaSiC can only separate the darkfield from the flatfield when the
-images span a wide range of brightness, and the tiles of one channel do not.
+images span a wide range of brightness, and the tiles of one channel do not. For dim
+channels without recorded dark frames, build one from the data with the darkfield
+builder (see [Building a darkfield for dim channels](#building-a-darkfield-for-dim-channels)).
 
 Both levels are kept for each field: the estimation-level files are what was actually
 fitted and are the reproducible artifacts, while the
@@ -224,6 +226,50 @@ The incumbent the search must beat is whatever `smoothness_flatfield` the solver
 configuration carries, so a candidate can never make the result worse than the
 configuration you supplied.
 
+## Building a darkfield for dim channels
+
+On dim channels the darkfield decides the flatfield (step 3 above warns "the darkfield
+matters" or "dim channel"). A scalar darkfield then leaves the camera pattern — the
+sensor halves and the row stripes — in the flatfield. Recorded dark frames are the best
+darkfield. Without them, `darkmap` builds one from the planes with the least light:
+
+```bash
+python -m aind_flatfield_correction.core.basicpy.darkmap \
+    s3://bucket/dataset/SPIM --tile-pattern '_ch_488\.ome\.zarr$' \
+    --output-name ch_488 --output-folder ./darkmaps
+
+python -m aind_flatfield_correction.core.basicpy.estimate \
+    s3://bucket/dataset/SPIM --tile-pattern '_ch_488\.ome\.zarr$' \
+    --darkfield-image ./darkmaps/darkfield_ch_488.npy --output-folder ./flats
+```
+
+1. Every plane of every tile is measured at a coarse level (`--pyramid-level`, default 3).
+2. The tiles whose darkest plane is darkest are kept (`--n-tiles`, default 12).
+3. For each, the full-resolution planes under its darkest plane are read and their
+   per-pixel median taken; the darkfield is the per-pixel median over the tiles.
+
+Planes in front of the tissue still receive scattered light, and its amount changes from
+tile to tile; a darkfield made from planes with light is too high and removes real signal.
+Using the darkest tiles keeps that light low, and the sidecar reports two checks:
+
+- `darkest_plane_spread` — how much the darkest-plane level changes across tiles. A camera
+  dark is the same in every tile, so a spread above 3 counts means the dark planes contain
+  light (HCR: 0.7–1.4 counts for camera-only darks, 8.3 for a channel whose dark planes
+  carried scattered light).
+- `over_subtracted_tiles` — the share of tiles whose darkest plane is below the darkfield's
+  mean, where the darkfield is certainly too high; above 10% it warns.
+
+On that HCR channel, a darkfield from 6 fixed tiles was too high for 63% of the tiles; the
+12 darkest tiles gave 3%, and the flatfield's signal CV fell from 3.2% to 1.35% (6, 12 or
+24 tiles gave the same result within the fit noise).
+
+| Output | Contents |
+|---|---|
+| `darkfield_<name>.npy` | The darkfield at full resolution; pass it to `--darkfield-image` |
+| `darkfield_<name>.png` | A preview |
+| `darkfield_<name>.json` | Tiles and planes used, the darkest-plane level of every tile, the two checks and their warnings, the darkfield's statistics, provenance |
+| `metadata/darkmap.log` | The run's log |
+
 ## Options
 
 | Flag | Default | Purpose |
@@ -233,7 +279,7 @@ configuration you supplied.
 | `--output-name` | last path segment | Names the outputs and figure titles |
 | `--pyramid-level` | `3` | Multiscale level the estimation runs on |
 | `--darkfield-value` | `0.0` | Scalar pedestal in ADU counts |
-| `--darkfield-image` | — | `.npy`/`.tif` darkfield; takes precedence, resized to the estimation level, and a stack of dark frames is averaged to one plane |
+| `--darkfield-image` | — | `.npy`/`.tif` darkfield; takes precedence, and a stack of dark frames is averaged to one plane. A full-resolution darkfield that is an exact multiple of the estimation level is averaged over blocks (a pyramid level is the block mean of full resolution, so this keeps the camera pattern the level holds); any other size is resized |
 | `--output-folder` | `flatfield_estimation` | Where the products are written |
 | `--method` | `fit` | `fit` is one joint fit; `per-z-median` fits each Z index across all tiles and takes the pixelwise median |
 | `--drop-concentrated-planes` | off | When the step-3 check finds concentrated signal, drop the bright planes with one dominant bright region before the fit (step 4); healthy channels keep every plane; only with `--method fit` |
@@ -342,6 +388,7 @@ ok, stats, reasons = report_flatfield(flatfield)
 |---|---|
 | `core.basicpy.estimate` | CLI, pre-fit checks and per-run orchestration |
 | `core.basicpy.tiles` | Tile discovery, plane loading, darkfield handling, plane scores and the plane filter |
+| `core.basicpy.darkmap` | Darkfield from the darkest planes of the darkest tiles, and its CLI |
 | `core.basicpy.search` | The entropy objective and the parameter search |
 | `core.basicpy.fit` | Joint and per-Z fitting, plausibility guard |
 | `core.basicpy.figures` | Inspection figures |
