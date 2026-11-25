@@ -14,6 +14,7 @@ import numpy as np
 from basicpy import BaSiC
 
 from aind_flatfield_correction.core.basicpy.config import (
+    FF_BOOST_CEILING,
     FF_REL_FLOOR,
     FF_SPAN_FLOOR,
     FF_STD_CEILING,
@@ -310,7 +311,13 @@ def check_flatfield_plausibility(
     Sanity-check a fitted flatfield.
 
     This is the check that catches an inverted objective: it fires when
-    the flatfield is so flat that the correction is a no-op.
+    the flatfield is so flat that the correction is a no-op.  It also
+    fires when the flatfield has a deep dip, the mark of a fit that learned
+    tissue: ``largest_boost``, the flatfield's
+    :data:`~aind_flatfield_correction.core.basicpy.config.FLAT_SCALE_PERCENTILE`
+    over its minimum, is how many times the correction brightens the
+    darkest part of the flatfield.  It is also the largest gain left after
+    :func:`scale_flatfield`.
 
     These are some heuristics based on experiments performed with basicpy.
     Please, double check with your data.
@@ -336,11 +343,23 @@ def check_flatfield_plausibility(
         "std": float(flat.std()),
         "mean": float(flat.mean()),
     }
+    finite = bool(np.isfinite(flat).all())
+    stats["largest_boost"] = (
+        float(np.percentile(flat, FLAT_SCALE_PERCENTILE) / stats["min"])
+        if finite and stats["min"] > 0
+        else float("nan")
+    )
     reasons = []
-    if not np.isfinite(flat).all():
+    if not finite:
         reasons.append("contains non-finite values")
     if stats["min"] <= 0:
         reasons.append(f"min {stats['min']:.4f} <= 0 (division would blow up)")
+    if stats["largest_boost"] > FF_BOOST_CEILING:
+        reasons.append(
+            f"largest boost {stats['largest_boost']:.1f}x > ceiling "
+            f"{FF_BOOST_CEILING:g}x (the correction brightens the darkest "
+            "part of the flatfield that many times)"
+        )
     if stats["std"] < FF_STD_FLOOR:
         reasons.append(
             f"std {stats['std']:.4f} < floor {FF_STD_FLOOR} "

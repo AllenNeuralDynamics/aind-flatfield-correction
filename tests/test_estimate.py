@@ -89,6 +89,22 @@ def _stack(n_tiles=4, planes=2, size=8):
     return FitStack(slices, offsets, planes, size, size, manifest)
 
 
+def _concentrated_stack():
+    """
+    Build a stack of dim planes with one bright, concentrated plane.
+
+    Returns
+    -------
+    FitStack
+        Four tiles of two 8 x 8 planes above a pedestal of 90; the second
+        plane of the first tile holds one very bright 3 x 3 region.
+    """
+    stack = _stack()
+    slices = np.full(stack.slices.shape, 100.0, dtype=np.float32)
+    slices[1, 2:5, 2:5] = 1090.0
+    return stack._replace(slices=slices)
+
+
 def _args(**overrides):
     """
     Parse a default argument set with overrides applied.
@@ -192,6 +208,15 @@ class TestBuildParser(unittest.TestCase):
         self.assertFalse(args.scale_flatfield)
         self.assertEqual(args.scale_percentile, 99.0)
 
+    def test_the_plane_filter_is_opt_in(self):
+        """Off unless asked for; it changes which planes are fitted."""
+        args = estimate.build_parser().parse_args(["/data/ch_405"])
+        self.assertFalse(args.drop_concentrated_planes)
+        args = estimate.build_parser().parse_args(
+            ["/data/ch_405", "--drop-concentrated-planes"]
+        )
+        self.assertTrue(args.drop_concentrated_planes)
+
     def test_rejects_an_unusable_percentile(self):
         """Caught at parse time, not after the fit."""
         for value in ("0", "100.5", "-1", "high"):
@@ -202,6 +227,110 @@ class TestBuildParser(unittest.TestCase):
                             estimate.build_parser().parse_args(
                                 ["/data", "--scale-percentile", value]
                             )
+
+
+class TestPrefitChecks(unittest.TestCase):
+    """The two conditions found to decide whether a flatfield is valid."""
+
+    def _checks(self, signal, dark_plane, slices=None):
+        """
+        Run the checks on a uniform stack, or on the given planes.
+
+        Parameters
+        ----------
+        signal : float
+            Value of every pixel of the uniform stack.
+        dark_plane : np.ndarray
+            Darkfield plane that was subtracted.
+        slices : np.ndarray or None, optional
+            Planes to check instead of the uniform stack.
+
+        Returns
+        -------
+        dict
+            The checks.
+        """
+        if slices is None:
+            slices = np.full((20, 8, 8), signal, dtype=np.float32)
+        return estimate.prefit_checks(
+            slices, dark_plane, tiles.plane_scores(slices)
+        )
+
+    def test_a_dim_channel_with_a_scalar_darkfield(self):
+        """The camera pattern a scalar leaves is a large part of 5 counts."""
+        checks = self._checks(5.0, np.full((8, 8), 90.0))
+        self.assertFalse(checks["per_pixel_darkfield"])
+        self.assertIsNone(checks["dark_error_ratio"])
+        self.assertEqual(len(checks["warnings"]), 1)
+        self.assertIn("dim channel", checks["warnings"][0])
+
+    def test_a_bright_channel_with_a_scalar_darkfield(self):
+        """SmartSPIM-like signal: nothing to warn about."""
+        checks = self._checks(150.0, np.full((8, 8), 105.0))
+        self.assertEqual(checks["warnings"], [])
+
+    def test_the_darkfield_matters_when_its_error_is_large(self):
+        """A per-pixel darkfield 1 count from a scalar, against 5 counts."""
+        dark = 90.0 + np.tile([-1.0, 1.0], (8, 4))
+        checks = self._checks(5.0, dark)
+        self.assertTrue(checks["per_pixel_darkfield"])
+        self.assertAlmostEqual(checks["dark_error_std"], 1.0)
+        self.assertAlmostEqual(checks["dark_error_ratio"], 0.2)
+        self.assertIn("the darkfield matters", checks["warnings"][0])
+
+    def test_a_small_darkfield_error_is_fine(self):
+        """The same darkfield against 150 counts of signal."""
+        dark = 90.0 + np.tile([-1.0, 1.0], (8, 4))
+        checks = self._checks(150.0, dark)
+        self.assertLess(checks["dark_error_ratio"], 0.10)
+        self.assertEqual(checks["warnings"], [])
+
+    def test_no_signal_above_the_darkfield(self):
+        """Nothing to fit a flatfield on."""
+        checks = self._checks(0.0, np.full((8, 8), 90.0))
+        self.assertIsNone(checks["dark_error_ratio"])
+        self.assertEqual(
+            checks["warnings"],
+            ["no signal above the darkfield in the fit planes"],
+        )
+
+    def test_concentrated_signal(self):
+        """A few planes with one bright region hold most of the objective."""
+        slices = np.full((40, 8, 8), 150.0, dtype=np.float32)
+        slices[:2, 2:5, 2:5] = 1e5
+        checks = self._checks(None, np.full((8, 8), 105.0), slices)
+        self.assertGreater(checks["plane_concentration"]["top_share"], 0.45)
+        self.assertLess(checks["concentrated_fraction"], 0.10)
+        self.assertTrue(checks["concentrated_signal"])
+        self.assertEqual(checks["bright_planes"], 2)
+        self.assertEqual(checks["concentrated_share_of_bright"], 1.0)
+        self.assertIn("--drop-concentrated-planes", checks["warnings"][-1])
+
+    def test_many_concentrated_planes(self):
+        """A third of the planes affected: the top-plane share stays low."""
+        slices = np.full((40, 8, 8), 150.0, dtype=np.float32)
+        slices[:12, 2:5, 2:5] = 1e4
+        checks = self._checks(None, np.full((8, 8), 105.0), slices)
+        self.assertLess(checks["plane_concentration"]["top_share"], 0.45)
+        self.assertEqual(checks["concentrated_planes"], 12)
+        self.assertAlmostEqual(checks["concentrated_fraction"], 0.3)
+        self.assertTrue(checks["concentrated_signal"])
+        self.assertIn("concentrated signal", checks["warnings"][-1])
+
+    def test_bright_planes_with_diffuse_tissue(self):
+        """Bright everywhere is not concentrated: nothing to warn about."""
+        slices = np.full((40, 8, 8), 150.0, dtype=np.float32)
+        slices[:12] = 1500.0
+        checks = self._checks(None, np.full((8, 8), 105.0), slices)
+        self.assertEqual(checks["concentrated_planes"], 0)
+        self.assertFalse(checks["concentrated_signal"])
+        self.assertEqual(checks["warnings"], [])
+
+    def test_no_bright_planes(self):
+        """The share of concentrated bright planes is then zero."""
+        checks = self._checks(150.0, np.full((8, 8), 105.0))
+        self.assertEqual(checks["bright_planes"], 0)
+        self.assertEqual(checks["concentrated_share_of_bright"], 0.0)
 
 
 class TestSelectParameters(unittest.TestCase):
@@ -575,7 +704,7 @@ class TestWriteProducts(unittest.TestCase):
 class TestEstimateDataset(unittest.TestCase):
     """One run, one flatfield."""
 
-    def _run(self, tmp, **overrides):
+    def _run(self, tmp, stack=None, **overrides):
         """
         Run the estimation with the loader and fit patched out.
 
@@ -583,6 +712,8 @@ class TestEstimateDataset(unittest.TestCase):
         ----------
         tmp : str
             Output folder.
+        stack : FitStack or None, optional
+            Stack the loader returns, by default :func:`_stack`.
         **overrides : Any
             Argument overrides.
 
@@ -599,7 +730,8 @@ class TestEstimateDataset(unittest.TestCase):
                 **overrides,
             }
         )
-        with patch.object(estimate, "load_fit_stack", return_value=_stack()):
+        stack = _stack() if stack is None else stack
+        with patch.object(estimate, "load_fit_stack", return_value=stack):
             with patch.object(
                 estimate,
                 "_run_fit",
@@ -754,6 +886,67 @@ class TestEstimateDataset(unittest.TestCase):
         np.testing.assert_array_equal(estimated, _plausible())
         self.assertFalse(sidecar["scaling"]["applied"])
 
+    def test_the_sidecar_records_the_prefit_checks(self):
+        """Measured before the fit, recorded whatever the outcome."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp)
+        checks = sidecar["checks"]
+        self.assertEqual(checks["signal"], 100.0)
+        self.assertFalse(checks["per_pixel_darkfield"])
+        self.assertIn("top_share", checks["plane_concentration"])
+        self.assertEqual(checks["warnings"], [])
+        self.assertFalse(checks["concentrated_signal"])
+        self.assertEqual(
+            sidecar["plane_filter"], {"enabled": False, "applied": False}
+        )
+
+    def test_the_plane_filter_drops_the_concentrated_plane(self):
+        """Asked for, and the check found concentrated signal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(
+                tmp, stack=_concentrated_stack(), drop_concentrated_planes=True
+            )
+            manifest = json.loads(
+                (Path(tmp) / "metadata" / "tiles_ch_405.json").read_text()
+            )
+        self.assertTrue(sidecar["checks"]["concentrated_signal"])
+        self.assertTrue(sidecar["plane_filter"]["enabled"])
+        self.assertTrue(sidecar["plane_filter"]["applied"])
+        self.assertEqual(sidecar["plane_filter"]["n_dropped"], 1)
+        self.assertEqual(
+            sidecar["plane_filter"]["dropped_per_tile"], {TILE_NAMES[0]: 1}
+        )
+        self.assertEqual(sidecar["n_fit_images"], 7)
+        self.assertEqual(manifest[0]["z_indices"], [0])
+
+    def test_without_the_filter_the_concentrated_plane_is_fitted(self):
+        """The check warns, but the default keeps every plane."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp, stack=_concentrated_stack())
+        self.assertTrue(sidecar["checks"]["concentrated_signal"])
+        self.assertTrue(
+            any(
+                "concentrated signal" in warning
+                for warning in sidecar["checks"]["warnings"]
+            )
+        )
+        self.assertEqual(sidecar["n_fit_images"], 8)
+        self.assertEqual(
+            sidecar["plane_filter"], {"enabled": False, "applied": False}
+        )
+
+    def test_the_filter_keeps_every_plane_of_a_healthy_stack(self):
+        """On, but nothing to drop: the check found no concentrated signal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp, drop_concentrated_planes=True)
+        self.assertFalse(sidecar["checks"]["concentrated_signal"])
+        self.assertEqual(sidecar["n_fit_images"], 8)
+        self.assertTrue(sidecar["plane_filter"]["enabled"])
+        self.assertFalse(sidecar["plane_filter"]["applied"])
+        self.assertIn(
+            "no concentrated signal", sidecar["plane_filter"]["reason"]
+        )
+
     def test_the_figures_show_the_scaled_flatfield(self):
         """They should show what an apply step will actually do."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -886,6 +1079,25 @@ class TestMain(unittest.TestCase):
             written = sorted(path.name for path in Path(tmp).iterdir())
         self.assertIn("flatfield_ch_405.npy", written)
         self.assertIn("flatfield_ch_405.json", written)
+
+    def test_rejects_the_plane_filter_with_the_per_z_method(self):
+        """Dropping single planes would leave the per-Z groups uneven."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.devnull, "w") as devnull:
+                with contextlib.redirect_stderr(devnull):
+                    with patch.object(estimate, "list_tiles") as lister:
+                        with self.assertRaises(SystemExit):
+                            estimate.main(
+                                [
+                                    "/data/ch_405",
+                                    "--method",
+                                    "per-z-median",
+                                    "--drop-concentrated-planes",
+                                    "--output-folder",
+                                    tmp,
+                                ]
+                            )
+        lister.assert_not_called()
 
     def test_writes_the_upsampled_flatfield_by_default(self):
         """On without asking, at the extent the metadata reports."""

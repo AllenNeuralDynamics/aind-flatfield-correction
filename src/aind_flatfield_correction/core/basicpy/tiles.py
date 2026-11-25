@@ -17,8 +17,15 @@ import numpy as np
 from aind_large_scale_prediction.io import OMEZarrReader
 from botocore import UNSIGNED
 from botocore.client import Config
+from skimage.filters import gaussian
 from skimage.transform import resize as sk_resize
 from tifffile import imread as tif_imread
+
+from aind_flatfield_correction.core.basicpy.config import (
+    BG_GRID_BLOCKS,
+    BRIGHT_RATIO,
+    LOCALIZED_MAX,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -611,3 +618,277 @@ def subtract_pedestal(
         info["dilution_if_fitted_on_raw"],
     )
     return fit_slices, info
+
+
+def plane_concentration(
+    fit_slices: np.ndarray, hot_ratio: float = 5.0
+) -> dict[str, float]:
+    """
+    Measure how unevenly the fit objective is spread across planes.
+
+    BaSiC minimises a squared error weighted by absolute intensity, so a few
+    very bright planes -- a tracer injection site, say -- can carry most of the
+    objective and pull the flatfield towards their own content. This reports
+    that imbalance so a caller can refuse the fit rather than trust it.
+
+    Measured over three SmartSPIM acquisitions: healthy channels scored 0.144
+    to 0.330, injection-contaminated ones 0.590 to 0.632. The figure is stable
+    against the plane budget -- the same channel read 0.594 at 280 planes and
+    0.577 at 1988.
+
+    ``hot_fraction`` is reported separately and is *not* a substitute for
+    ``top_share``: one healthy channel held 44 planes above the ratio while
+    scoring only 0.199, because those planes were moderately bright rather
+    than dominant.
+
+    Parameters
+    ----------
+    fit_slices : np.ndarray
+        Pedestal-subtracted ``(N, H, W)`` fitting stack.
+    hot_ratio : float, optional
+        Multiple of the median plane mean above which a plane counts as hot,
+        by default 5.0.
+
+    Returns
+    -------
+    dict
+        ``top_share`` (fraction of the total sum-of-squares held by the
+        brightest 3.6% of planes), ``top_n`` (how many planes that is),
+        ``hot_fraction``, ``hot_planes`` and ``plane_mean_ratio`` (brightest
+        plane mean over the median).
+    """
+    energy = (np.asarray(fit_slices, dtype=np.float64) ** 2).sum(axis=(1, 2))
+    total = float(energy.sum())
+    n_planes = int(energy.size)
+    # 10 of 280 was the reference proportion these thresholds were measured at.
+    top_n = max(1, round(n_planes * 10 / 280))
+    ranked = np.sort(energy)[::-1]
+    top_share = float(ranked[:top_n].sum() / total) if total else float("nan")
+
+    plane_means = np.asarray(fit_slices, dtype=np.float64).mean(axis=(1, 2))
+    median_mean = float(np.median(plane_means))
+    hot = plane_means > hot_ratio * median_mean
+
+    return {
+        "top_share": top_share,
+        "top_n": top_n,
+        "n_planes": n_planes,
+        "hot_planes": int(hot.sum()),
+        "hot_fraction": float(hot.mean()),
+        "plane_mean_ratio": (
+            float(plane_means.max() / median_mean)
+            if median_mean
+            else float("nan")
+        ),
+    }
+
+
+def background_map(
+    plane: np.ndarray, n_blocks: int = BG_GRID_BLOCKS
+) -> np.ndarray:
+    """
+    Map the diffuse background of one plane on a coarse grid.
+
+    Each grid cell is the median of one block of pixels, so sparse bright
+    cells do not change it and the map shows how the diffuse signal is
+    spread over the field of view.  The block size comes from the short
+    side of the plane, so that the same physical block is used at every
+    pyramid level.  A Gaussian of one block then removes the remaining
+    noise.
+
+    Parameters
+    ----------
+    plane : np.ndarray
+        One pedestal-subtracted ``(H, W)`` plane.
+    n_blocks : int, optional
+        Number of blocks on the short side, by default
+        :data:`~aind_flatfield_correction.core.basicpy.config.BG_GRID_BLOCKS`.
+
+    Returns
+    -------
+    np.ndarray
+        The background map, one value per block.
+    """
+    plane = np.asarray(plane, dtype=np.float32)
+    block = max(1, min(plane.shape) // n_blocks)
+    rows, cols = plane.shape[0] // block, plane.shape[1] // block
+    blocks = (
+        plane[: rows * block, : cols * block]
+        .reshape(rows, block, cols, block)
+        .transpose(0, 2, 1, 3)
+        .reshape(rows, cols, -1)
+    )
+    return gaussian(
+        np.median(blocks, axis=2),
+        sigma=1.0,
+        mode="reflect",
+        preserve_range=True,
+    )
+
+
+def plane_scores(fit_slices: np.ndarray) -> dict[str, np.ndarray]:
+    """
+    Score every plane for brightness and for concentrated signal.
+
+    ``localized`` is the 99th percentile of the plane's background map over
+    its median.  Diffuse signal gives a value near the range of the
+    illumination itself (about 1.2-2.5); one region much brighter than the
+    rest of the plane gives a much larger value (median 46 on SmartSPIM 561,
+    where the flatfield learned the tissue).  A plane whose median is not
+    above zero is mostly empty, its ratio is meaningless and is NaN, so such
+    a plane never counts as concentrated.
+
+    Parameters
+    ----------
+    fit_slices : np.ndarray
+        Pedestal-subtracted ``(N, H, W)`` fitting stack.
+
+    Returns
+    -------
+    dict
+        ``mean`` (plane mean), ``level`` (median of the background map) and
+        ``localized`` (99th percentile over median), one value per plane.
+    """
+    n_planes = fit_slices.shape[0]
+    means = np.asarray(fit_slices, dtype=np.float64).mean(axis=(1, 2))
+    level = np.zeros(n_planes, dtype=np.float64)
+    localized = np.full(n_planes, np.nan, dtype=np.float64)
+    for index in range(n_planes):
+        bg_map = background_map(fit_slices[index])
+        level[index] = float(np.median(bg_map))
+        if level[index] > 0:
+            localized[index] = float(np.percentile(bg_map, 99)) / level[index]
+    return {"mean": means, "level": level, "localized": localized}
+
+
+def concentrated_planes(
+    scores: dict[str, np.ndarray],
+    bright_ratio: float = BRIGHT_RATIO,
+    localized_max: float = LOCALIZED_MAX,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Find the planes that are bright and have one dominant bright region.
+
+    Both conditions are needed.  Bright planes whose tissue covers the whole
+    view are among the best planes for a flatfield, and a concentrated plane
+    that is not bright carries little of the fit objective.
+
+    Parameters
+    ----------
+    scores : dict
+        Output of :func:`plane_scores`.
+    bright_ratio : float, optional
+        Multiple of the median plane mean above which a plane is bright.
+    localized_max : float, optional
+        ``localized`` value above which a plane is concentrated.
+
+    Returns
+    -------
+    tuple of (np.ndarray, np.ndarray)
+        Boolean masks of the bright planes and of the planes that are both
+        bright and concentrated.
+    """
+    means = scores["mean"]
+    median_mean = float(np.median(means))
+    if median_mean > 0:
+        bright = means > bright_ratio * median_mean
+    else:
+        bright = np.zeros(means.shape, dtype=bool)
+    # NaN (a mostly empty plane) compares False, so it is never dropped.
+    with np.errstate(invalid="ignore"):
+        concentrated = scores["localized"] > localized_max
+    return bright, bright & concentrated
+
+
+def drop_concentrated_planes(
+    fit_slices: np.ndarray,
+    stack: FitStack,
+    scores: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, FitStack, dict]:
+    """
+    Remove the bright, concentrated planes before the joint fit.
+
+    BaSiC sorts the values of each pixel across the images, so its top
+    sorted images are the brightest value any plane has at each pixel.  When
+    the bright planes hold one dominant region each, those top images show
+    where the regions are, and the brightness-weighted flatfield update
+    follows them: the flatfield learns the tissue.  Removing these planes
+    fixed SmartSPIM 561 on both laser sides and left the flatfields of the
+    other channels unchanged.
+
+    The per-tile spans and the tile manifest are rebuilt for the kept
+    planes.  A tile can be left with no planes; the search's subsampling
+    skips an empty span.  At least half of the planes are always kept: a
+    plane is bright only above a multiple of the median plane mean.
+
+    Parameters
+    ----------
+    fit_slices : np.ndarray
+        Pedestal-subtracted ``(N, H, W)`` fitting stack.
+    stack : FitStack
+        The raw stack the fitting stack was made from.
+    scores : dict or None, optional
+        Output of :func:`plane_scores`, computed here when None.
+
+    Returns
+    -------
+    tuple of (np.ndarray, FitStack, dict)
+        The kept fitting planes, the stack rebuilt for them, and a report of
+        what was dropped.
+    """
+    if scores is None:
+        scores = plane_scores(fit_slices)
+    _, drop = concentrated_planes(scores)
+    report = {
+        "enabled": True,
+        "rule": {
+            "bright_ratio": BRIGHT_RATIO,
+            "localized_max": LOCALIZED_MAX,
+        },
+        "n_candidates": int(drop.size),
+        "top_share_before": plane_concentration(fit_slices)["top_share"],
+    }
+    keep = ~drop
+
+    z_offsets: dict[int, tuple[int, int]] = {}
+    manifest: list[TileRecord] = []
+    dropped_per_tile: dict[str, int] = {}
+    offset = 0
+    for index in sorted(stack.z_offsets):
+        start, end = stack.z_offsets[index]
+        tile_keep = keep[start:end]
+        n_kept = int(tile_keep.sum())
+        z_offsets[index] = (offset, offset + n_kept)
+        offset += n_kept
+        if index < len(stack.manifest):
+            record = stack.manifest[index]
+            z_kept = tuple(
+                z for z, kept in zip(record.z_indices, tile_keep) if kept
+            )
+            manifest.append(record._replace(z_indices=z_kept))
+            if n_kept < end - start:
+                dropped_per_tile[record.name] = end - start - n_kept
+
+    kept_slices = fit_slices[keep]
+    new_stack = stack._replace(
+        slices=stack.slices[keep],
+        z_offsets=z_offsets,
+        manifest=tuple(manifest),
+    )
+    report.update(
+        {
+            "n_dropped": int(drop.sum()),
+            "n_kept": int(keep.sum()),
+            "dropped_per_tile": dropped_per_tile,
+            "top_share_after": plane_concentration(kept_slices)["top_share"],
+        }
+    )
+    logger.info(
+        "  Plane filter: dropped %d of %d planes (bright and concentrated); "
+        "top-plane share %.3f -> %.3f",
+        report["n_dropped"],
+        report["n_candidates"],
+        report["top_share_before"],
+        report["top_share_after"],
+    )
+    return kept_slices, new_stack, report
