@@ -183,6 +183,55 @@ class TestPlotVignetting(unittest.TestCase):
             ["cv_x_after", "cv_x_before", "cv_y_after", "cv_y_before"],
         )
 
+    def test_reports_the_signal_cv_given_the_dimmest_planes(self):
+        """The darkfield cancels, so the true flatfield scores about 0."""
+        stack, flatfield, dark = _graded_stack()
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics = figures._plot_vignetting(
+                "ch_405",
+                stack.slices.mean(axis=0),
+                flatfield,
+                dark,
+                Path(tmp) / "v.png",
+                figures.low_plane_mean(stack.slices),
+            )
+        for key in ("x", "y"):
+            self.assertGreater(metrics[f"signal_cv_{key}_before"], 1.0)
+            self.assertAlmostEqual(
+                metrics[f"signal_cv_{key}_after"], 0.0, places=3
+            )
+
+
+def _graded_stack():
+    """
+    Build a vignetted stack whose planes differ in brightness.
+
+    Returns
+    -------
+    tuple of (FitStack, np.ndarray, np.ndarray)
+        The stack, the flatfield that flattens it, and the darkfield.
+    """
+    stack, flatfield, dark = _vignetted_stack()
+    gains = np.linspace(0.2, 2.0, stack.slices.shape[0])[:, None, None]
+    slices = (dark + gains * 100.0 * flatfield).astype(np.float32)
+    return stack._replace(slices=slices), flatfield, dark
+
+
+class TestLowPlaneMean(unittest.TestCase):
+    """The mean of the dimmest planes, for the signal CV."""
+
+    def test_averages_the_dimmest_share(self):
+        """A tenth of 20 planes is the two dimmest."""
+        slices = np.arange(20, dtype=np.float32)[::-1, None, None] * np.ones(
+            (20, 2, 2), dtype=np.float32
+        )
+        np.testing.assert_allclose(figures.low_plane_mean(slices), 0.5)
+
+    def test_uses_at_least_one_plane(self):
+        """A tiny stack still has a dimmest plane."""
+        slices = np.stack([np.full((2, 2), v) for v in (5.0, 3.0, 9.0)])
+        np.testing.assert_allclose(figures.low_plane_mean(slices), 3.0)
+
 
 class TestPlotFigures(unittest.TestCase):
     """The overview and per-tile panels."""
@@ -417,6 +466,24 @@ class TestSaveValidationFigures(unittest.TestCase):
                 1,
             )
         self.assertLess(metrics["cv_x_after"], metrics["cv_x_before"])
+
+    def test_returns_the_signal_cv(self):
+        """The darkfield-free flatness ends up in the sidecar too."""
+        stack, flatfield, dark = _graded_stack()
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics = figures.save_validation_figures(
+                "ch_405",
+                flatfield,
+                dark,
+                stack,
+                TILE_NAMES,
+                Path(tmp) / "ch",
+                3,
+                1,
+            )
+        self.assertLess(
+            metrics["signal_cv_y_after"], metrics["signal_cv_y_before"]
+        )
 
 
 if __name__ == "__main__":

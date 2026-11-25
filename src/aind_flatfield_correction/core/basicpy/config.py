@@ -18,7 +18,15 @@ logger = logging.getLogger(__name__)
 SMOOTHNESS_KEY = "smoothness_flatfield"
 
 # Use ladmap instead of approximate, in practice it gave better results
-# Baseline parameters
+# Baseline parameters.
+#
+# smoothness_darkfield and sparse_cost_darkfield do nothing while
+# get_darkfield is False.  If get_darkfield is turned on, the value 20 makes
+# the LADMAP solver shrink BaSiC's per-pixel darkfield to exactly zero, so
+# only one constant can be learned.  Do not rely on BaSiC's own darkfield
+# in any case: on dim HCR and on SmartSPIM channels it returned 0-6 counts
+# against a measured camera dark of 90-104, with these settings and with
+# basicpy's defaults.  Pass a measured darkfield instead.
 BASIC_CONFIG = {
     "get_darkfield": False,
     "sort_intensity": True,
@@ -44,6 +52,48 @@ FF_STD_FLOOR = 0.030
 FF_SPAN_FLOOR = 0.100
 FF_STD_CEILING = 0.50
 FF_REL_FLOOR = 0.60
+
+# Ceiling on the largest boost of the correction, p99.9 / min of the
+# flatfield: how many times dividing by the flatfield brightens its darkest
+# part relative to its bright part.  Accepted flatfields of HCR and
+# SmartSPIM data measured 1.4-2.9; flatfields that learned tissue measured
+# 17-358 (SmartSPIM 561) while some still passed the std ceiling.
+FF_BOOST_CEILING = 5.0
+
+# Pre-fit checks (written to the sidecar, never fatal).
+#
+# Dark error over signal: the flatfield error is about the dark error
+# divided by the signal.  It measured 25-150% on dim HCR channels, whose
+# scalar-dark flats were worse than no flatfield, and 0.6-1.4% on
+# SmartSPIM channels.
+DARK_ERROR_WARN = 0.10
+# Signal (median plane mean above the dark) below which a scalar dark is
+# likely to leave the camera pattern (0.7-3 counts std in the data
+# measured) in the flatfield.  Dim HCR channels: 0.3-9 counts; SmartSPIM
+# channels: 106-162 counts.
+DIM_SIGNAL_WARN = 30.0
+# Share of the fit objective held by the brightest planes
+# (``tiles.plane_concentration``) above which the signal is concentrated:
+# healthy channels 0.14-0.33, SmartSPIM 561 0.55-0.63.
+CONCENTRATION_WARN = 0.45
+
+# Plane filter (--drop-concentrated-planes).  A plane is dropped when it is
+# bright, its mean above BRIGHT_RATIO x the median plane mean, AND
+# concentrated, the 99th percentile of its background map above
+# LOCALIZED_MAX x the map's median.  On SmartSPIM 561 this dropped about
+# 20% of the planes per laser side and removed the tissue from the
+# flatfield; on healthy channels it dropped 0-6% and left the flatfield
+# unchanged.  Dropping every bright plane instead removed the best planes
+# of a channel whose bright tissue covers the whole view.
+BRIGHT_RATIO = 3.0
+LOCALIZED_MAX = 3.0
+# Number of blocks on the short side of the background map, so that the
+# same physical block size is used at every pyramid level.
+BG_GRID_BLOCKS = 40
+
+# Share of the fitted planes, the dimmest by mean, whose mean is subtracted
+# for the signal CV.  The darkfield cancels in that difference.
+SIGNAL_LOW_FRACTION = 0.10
 
 # Percentile of the accepted flatfield that is rescaled to 1.0 before it
 # is saved.  Dividing by basicpy's mean-1 flatfield dims every pixel

@@ -19,9 +19,16 @@ from typing import Any
 
 import numpy as np
 
-from aind_flatfield_correction.core.basicpy.config import Z_FRACTION
+from aind_flatfield_correction.core.basicpy.config import (
+    SIGNAL_LOW_FRACTION,
+    Z_FRACTION,
+)
 from aind_flatfield_correction.core.basicpy.tiles import FitStack
-from aind_flatfield_correction.metrics.metrics import cv, masked_profile
+from aind_flatfield_correction.metrics.metrics import (
+    cv,
+    masked_profile,
+    signal_cv,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -429,12 +436,38 @@ def _plot_tile_profile(
     plt.close(fig)
 
 
+def low_plane_mean(
+    slices: np.ndarray, fraction: float = SIGNAL_LOW_FRACTION
+) -> np.ndarray:
+    """
+    Average the dimmest planes of a stack.
+
+    Parameters
+    ----------
+    slices : np.ndarray
+        ``(N, H, W)`` stack of raw planes.
+    fraction : float, optional
+        Share of the planes to average, the dimmest by plane mean; at
+        least one plane is used.
+
+    Returns
+    -------
+    np.ndarray
+        The ``(H, W)`` mean of the dimmest planes.
+    """
+    plane_means = np.asarray(slices, dtype=np.float64).mean(axis=(1, 2))
+    n_low = max(1, int(round(fraction * plane_means.size)))
+    dimmest = np.argsort(plane_means)[:n_low]
+    return np.asarray(slices[np.sort(dimmest)], dtype=np.float64).mean(axis=0)
+
+
 def _plot_vignetting(
     label: str,
     mean_raw: np.ndarray,
     flatfield: np.ndarray,
     dark_plane: np.ndarray,
     out_path: Path,
+    mean_low: np.ndarray | None = None,
 ) -> dict[str, float]:
     """
     Profile the mean of every fitted plane, before and after correction.
@@ -444,6 +477,12 @@ def _plot_vignetting(
     needs no tile positions.  The profiles average occupied pixels only:
     tiles smaller than the padded plane leave zeros behind, and
     averaging those in as real values would flatten the curves.
+
+    The ``cv_*`` values divide by the mean of the corrected image, so a
+    darkfield that is too low makes them look better.  When ``mean_low``
+    is given, the ``signal_cv_*`` values are also returned: the same
+    profiles of the mean minus ``mean_low``, in which the darkfield
+    cancels (:func:`~aind_flatfield_correction.metrics.metrics.signal_cv`).
 
     Parameters
     ----------
@@ -457,6 +496,8 @@ def _plot_vignetting(
         Darkfield plane.
     out_path : Path
         PNG path to write.
+    mean_low : np.ndarray or None, optional
+        Mean of the dimmest raw planes (:func:`low_plane_mean`).
 
     Returns
     -------
@@ -494,6 +535,20 @@ def _plot_vignetting(
             metrics[f"cv_{key}_before"],
             metrics[f"cv_{key}_after"],
         )
+    if mean_low is not None:
+        for axis, key in ((0, "x"), (1, "y")):
+            metrics[f"signal_cv_{key}_before"] = signal_cv(
+                mean_raw, mean_low, 1.0, axis
+            )
+            metrics[f"signal_cv_{key}_after"] = signal_cv(
+                mean_raw, mean_low, flatfield, axis
+            )
+            logger.info(
+                "  Signal CV - %s: before=%.2f%%  corrected=%.2f%%",
+                key.upper(),
+                metrics[f"signal_cv_{key}_before"],
+                metrics[f"signal_cv_{key}_after"],
+            )
     return metrics
 
 
@@ -544,6 +599,7 @@ def save_validation_figures(
         flatfield,
         dark_plane,
         vignetting,
+        low_plane_mean(stack.slices),
     )
     written = [str(vignetting)]
 

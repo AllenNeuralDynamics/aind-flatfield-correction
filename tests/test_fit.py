@@ -273,6 +273,36 @@ class TestCheckFlatfieldPlausibility(unittest.TestCase):
         )
         self.assertTrue(ok)
 
+    def test_reports_the_largest_boost(self):
+        """The 99.9th percentile over the minimum of the flatfield."""
+        flat = _plausible()
+        _, stats, _ = fit.check_flatfield_plausibility(flat)
+        self.assertAlmostEqual(
+            stats["largest_boost"],
+            float(np.percentile(flat.astype(np.float64), 99.9) / flat.min()),
+            places=6,
+        )
+        self.assertLess(stats["largest_boost"], 5.0)
+
+    def test_rejects_a_deep_dip(self):
+        """A fit that learned tissue: std within limits, minimum 0.05."""
+        flat = _plausible()
+        flat[0, :2] = 0.05
+        ok, stats, reasons = fit.check_flatfield_plausibility(flat)
+        self.assertFalse(ok)
+        self.assertGreater(stats["largest_boost"], 5.0)
+        self.assertLess(stats["std"], 0.5)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("largest boost", reasons[0])
+
+    def test_the_boost_is_undefined_without_a_positive_minimum(self):
+        """The minimum check fires instead of a division by zero."""
+        flat = _plausible()
+        flat[0, 0] = 0.0
+        _, stats, reasons = fit.check_flatfield_plausibility(flat)
+        self.assertTrue(np.isnan(stats["largest_boost"]))
+        self.assertFalse(any("largest boost" in r for r in reasons))
+
 
 class TestScaleFlatfield(unittest.TestCase):
     """Rescaling so the correction stops dimming the tile centre."""

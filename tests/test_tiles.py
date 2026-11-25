@@ -501,5 +501,262 @@ class TestSubtractPedestal(unittest.TestCase):
         self.assertTrue(np.isnan(info["dilution_if_fitted_on_raw"]))
 
 
+class TestPlaneConcentration(unittest.TestCase):
+    """Measuring how unevenly the fit objective is spread across planes."""
+
+    def test_a_uniform_stack_spreads_its_objective_evenly(self):
+        """With every plane alike, the brightest few hold their fair share."""
+        slices = np.ones((280, 4, 5), dtype=np.float32)
+        info = tiles.plane_concentration(slices)
+        self.assertEqual(info["top_n"], 10)
+        self.assertEqual(info["n_planes"], 280)
+        self.assertAlmostEqual(info["top_share"], 10 / 280, places=6)
+        self.assertEqual(info["hot_planes"], 0)
+
+    def test_a_few_bright_planes_dominate(self):
+        """This is the injection-site signature the threshold keys on."""
+        slices = np.ones((280, 4, 5), dtype=np.float32)
+        slices[:10] *= 60.0
+        info = tiles.plane_concentration(slices)
+        self.assertGreater(info["top_share"], 0.5)
+        self.assertEqual(info["hot_planes"], 10)
+        self.assertAlmostEqual(info["plane_mean_ratio"], 60.0, places=4)
+
+    def test_hot_planes_are_counted_separately_from_the_share(self):
+        """Many mildly bright planes are not the same as a few dominant."""
+        slices = np.ones((280, 4, 5), dtype=np.float32)
+        slices[:44] *= 6.0
+        info = tiles.plane_concentration(slices)
+        self.assertEqual(info["hot_planes"], 44)
+        # 44 hot planes, yet the brightest 10 hold well under half.
+        self.assertLess(info["top_share"], 0.5)
+
+    def test_an_all_zero_stack_reports_nan_rather_than_dividing(self):
+        """A dead channel must not raise here."""
+        info = tiles.plane_concentration(np.zeros((8, 2, 2), dtype=np.float32))
+        self.assertTrue(np.isnan(info["top_share"]))
+        self.assertTrue(np.isnan(info["plane_mean_ratio"]))
+
+    def test_the_top_slice_is_at_least_one_plane(self):
+        """A tiny stack still has a brightest plane."""
+        info = tiles.plane_concentration(np.ones((3, 2, 2), dtype=np.float32))
+        self.assertEqual(info["top_n"], 1)
+        self.assertAlmostEqual(info["hot_fraction"], 0.0, places=6)
+
+
+DIM, BRIGHT, PATCH = 10.0, 100.0, 1000.0
+
+
+def _plane(kind, height=40, width=50):
+    """
+    Build one pedestal-subtracted test plane.
+
+    Parameters
+    ----------
+    kind : str
+        ``dim`` (uniform, dim), ``bright`` (uniform, bright),
+        ``concentrated`` (dim with one very bright region: bright overall)
+        or ``dim_patch`` (dim with one small, moderately bright region).
+    height : int, optional
+        Plane height, by default 40.
+    width : int, optional
+        Plane width, by default 50.
+
+    Returns
+    -------
+    np.ndarray
+        The plane.
+    """
+    plane = np.full((height, width), DIM, dtype=np.float32)
+    if kind == "bright":
+        plane[:] = BRIGHT
+    elif kind == "concentrated":
+        plane[5:20, 5:20] = PATCH
+    elif kind == "dim_patch":
+        plane[5:10, 5:10] = BRIGHT
+    return plane
+
+
+def _concentrated_stack(layout, pedestal=90.0):
+    """
+    Build a fitting stack and its raw stack from per-tile plane kinds.
+
+    Parameters
+    ----------
+    layout : list of list of str
+        Plane kinds of each tile, in Z order (see :func:`_plane`).
+    pedestal : float, optional
+        Value added to make the raw planes, by default 90.
+
+    Returns
+    -------
+    tuple of (np.ndarray, FitStack)
+        The pedestal-subtracted planes and the raw stack.
+    """
+    planes, offsets, manifest = [], {}, []
+    for index, kinds in enumerate(layout):
+        offsets[index] = (len(planes), len(planes) + len(kinds))
+        planes.extend(_plane(kind) for kind in kinds)
+        manifest.append(
+            tiles.TileRecord(
+                name=f"tile_{index}",
+                shape=(100, 40, 50),
+                z_indices=tuple(range(10, 10 + 2 * len(kinds), 2)),
+                mean=0.0,
+                padded=False,
+            )
+        )
+    fit_slices = np.stack(planes)
+    stack = tiles.FitStack(
+        fit_slices + pedestal,
+        offsets,
+        len(layout[0]),
+        40,
+        50,
+        tuple(manifest),
+    )
+    return fit_slices, stack
+
+
+LAYOUT = [
+    ["dim", "dim", "concentrated", "dim", "bright", "dim"],
+    ["dim"] * 6,
+    ["concentrated"] * 6,
+    ["dim", "dim_patch", "dim", "dim", "dim", "dim"],
+]
+
+
+class TestBackgroundMap(unittest.TestCase):
+    """The diffuse background of one plane on a coarse grid."""
+
+    def test_blocks_come_from_the_short_side(self):
+        """The same physical block at every pyramid level."""
+        self.assertEqual(
+            tiles.background_map(np.ones((400, 500))).shape, (40, 50)
+        )
+        self.assertEqual(
+            tiles.background_map(np.ones((40, 50))).shape, (40, 50)
+        )
+
+    def test_ignores_sparse_bright_pixels(self):
+        """A block median is not moved by a few bright cells."""
+        plane = np.full((400, 500), 10.0, dtype=np.float32)
+        plane[::10, ::10] = 1e4
+        np.testing.assert_allclose(tiles.background_map(plane), 10.0)
+
+
+class TestPlaneScores(unittest.TestCase):
+    """Brightness and concentration of every plane."""
+
+    def test_diffuse_and_concentrated_planes(self):
+        """Uniform signal scores 1; one dominant region scores much more."""
+        planes = np.stack(
+            [_plane("dim"), _plane("concentrated"), np.zeros((40, 50))]
+        )
+        scores = tiles.plane_scores(planes)
+        self.assertAlmostEqual(scores["localized"][0], 1.0, places=5)
+        self.assertGreater(scores["localized"][1], 3.0)
+        self.assertAlmostEqual(scores["level"][0], DIM, places=4)
+        self.assertAlmostEqual(scores["mean"][0], DIM, places=4)
+
+    def test_an_empty_plane_has_no_ratio(self):
+        """Its median is zero, so it can never count as concentrated."""
+        scores = tiles.plane_scores(np.zeros((1, 40, 50), dtype=np.float32))
+        self.assertTrue(np.isnan(scores["localized"][0]))
+        self.assertEqual(scores["level"][0], 0.0)
+
+
+class TestConcentratedPlanes(unittest.TestCase):
+    """Bright AND concentrated, never one of the two alone."""
+
+    def test_needs_both_conditions(self):
+        """Bright diffuse and dim concentrated planes are kept."""
+        fit_slices, _ = _concentrated_stack(LAYOUT)
+        bright, both = tiles.concentrated_planes(
+            tiles.plane_scores(fit_slices)
+        )
+        kinds = [kind for tile in LAYOUT for kind in tile]
+        self.assertEqual(
+            [k for k, b in zip(kinds, bright) if b],
+            ["concentrated", "bright"] + ["concentrated"] * 6,
+        )
+        self.assertEqual(
+            [k for k, d in zip(kinds, both) if d], ["concentrated"] * 7
+        )
+
+    def test_nothing_is_bright_when_most_planes_are_empty(self):
+        """A median plane mean of zero gives no scale for brightness."""
+        scores = {
+            "mean": np.array([0.0, 0.0, 5.0]),
+            "localized": np.array([np.nan, np.nan, 10.0]),
+        }
+        bright, both = tiles.concentrated_planes(scores)
+        self.assertFalse(bright.any())
+        self.assertFalse(both.any())
+
+
+class TestDropConcentratedPlanes(unittest.TestCase):
+    """Removing the planes that teach the flatfield the tissue."""
+
+    def test_drops_only_the_bright_concentrated_planes(self):
+        """Seven planes go; the bright diffuse plane stays."""
+        fit_slices, stack = _concentrated_stack(LAYOUT)
+        kept, new_stack, report = tiles.drop_concentrated_planes(
+            fit_slices, stack
+        )
+        self.assertEqual(report["n_candidates"], 24)
+        self.assertEqual(report["n_dropped"], 7)
+        self.assertEqual(report["n_kept"], 17)
+        self.assertEqual(kept.shape, (17, 40, 50))
+        self.assertEqual(new_stack.slices.shape, (17, 40, 50))
+        np.testing.assert_allclose(new_stack.slices, kept + 90.0)
+        self.assertTrue(report["enabled"])
+        self.assertEqual(report["rule"]["bright_ratio"], 3.0)
+        self.assertEqual(
+            report["top_share_before"],
+            tiles.plane_concentration(fit_slices)["top_share"],
+        )
+        self.assertEqual(
+            report["top_share_after"],
+            tiles.plane_concentration(kept)["top_share"],
+        )
+
+    def test_rebuilds_the_spans_and_the_manifest(self):
+        """A tile left with no planes keeps an empty span."""
+        fit_slices, stack = _concentrated_stack(LAYOUT)
+        _, new_stack, report = tiles.drop_concentrated_planes(
+            fit_slices, stack
+        )
+        self.assertEqual(
+            new_stack.z_offsets,
+            {0: (0, 5), 1: (5, 11), 2: (11, 11), 3: (11, 17)},
+        )
+        self.assertEqual(new_stack.manifest[0].z_indices, (10, 12, 16, 18, 20))
+        self.assertEqual(new_stack.manifest[2].z_indices, ())
+        self.assertEqual(
+            report["dropped_per_tile"], {"tile_0": 1, "tile_2": 6}
+        )
+        self.assertEqual(new_stack.n_planes, stack.n_planes)
+
+    def test_reuses_given_scores(self):
+        """The scores of the pre-fit checks are not computed twice."""
+        fit_slices, stack = _concentrated_stack(LAYOUT)
+        scores = tiles.plane_scores(fit_slices)
+        with patch.object(tiles, "plane_scores") as scorer:
+            tiles.drop_concentrated_planes(fit_slices, stack, scores)
+        scorer.assert_not_called()
+
+    def test_a_stack_without_a_manifest(self):
+        """Spans are still rebuilt; nothing is named per tile."""
+        fit_slices, stack = _concentrated_stack(LAYOUT)
+        stack = stack._replace(manifest=())
+        _, new_stack, report = tiles.drop_concentrated_planes(
+            fit_slices, stack
+        )
+        self.assertEqual(new_stack.manifest, ())
+        self.assertEqual(report["dropped_per_tile"], {})
+        self.assertEqual(new_stack.z_offsets[2], (11, 11))
+
+
 if __name__ == "__main__":
     unittest.main()

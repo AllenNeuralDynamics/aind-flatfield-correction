@@ -66,6 +66,9 @@ from matplotlib.image import imsave
 import numpy as np
 
 from aind_flatfield_correction.core.basicpy.config import (
+    CONCENTRATION_WARN,
+    DARK_ERROR_WARN,
+    DIM_SIGNAL_WARN,
     FLAT_SCALE_PERCENTILE,
     baseline_params,
     load_basic_config,
@@ -87,10 +90,14 @@ from aind_flatfield_correction.core.basicpy.search import (
 from aind_flatfield_correction.core.basicpy.tiles import (
     FULL_RESOLUTION_LEVEL,
     FitStack,
+    concentrated_planes,
+    drop_concentrated_planes,
     list_tiles,
     load_darkfield,
     load_fit_stack,
     match_darkfield,
+    plane_concentration,
+    plane_scores,
     probe_plane_shape,
     resize_plane,
     subtract_pedestal,
@@ -137,6 +144,95 @@ class FitResult(NamedTuple):
     ok: bool
     stats: dict[str, float]
     reasons: list[str]
+
+
+def prefit_checks(
+    fit_slices: np.ndarray,
+    dark_plane: np.ndarray,
+    scores: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    """
+    Check the fitting stack for the conditions that broke flatfields.
+
+    Two conditions were found to decide whether a flatfield is valid,
+    and both can be measured before the fit.
+
+    * **The darkfield matters.**  The flatfield error is about the
+      darkfield error divided by the signal.  With a per-pixel darkfield,
+      ``dark_error_ratio`` is how far it is from a scalar, relative to the
+      signal: above :data:`DARK_ERROR_WARN` the darkfield decides the
+      flatfield and must be accurate.  With a scalar darkfield the error
+      cannot be measured, so a signal below :data:`DIM_SIGNAL_WARN` counts
+      is flagged instead: the camera pattern a scalar leaves behind is then
+      a large part of the signal.
+    * **The signal is concentrated.**  When the brightest planes hold more
+      than :data:`CONCENTRATION_WARN` of the fit objective, the flatfield
+      can learn the tissue (see :func:`tiles.drop_concentrated_planes`).
+
+    The checks only warn and are recorded in the sidecar; nothing is
+    refused.
+
+    Parameters
+    ----------
+    fit_slices : np.ndarray
+        Pedestal-subtracted fitting stack.
+    dark_plane : np.ndarray
+        Darkfield plane subtracted from it.
+    scores : dict
+        Output of :func:`tiles.plane_scores` for ``fit_slices``.
+
+    Returns
+    -------
+    dict
+        The measured values and one message per warning.
+    """
+    signal = float(np.median(scores["mean"]))
+    dark = np.asarray(dark_plane, dtype=np.float64)
+    dark_error = float(np.std(dark - np.median(dark)))
+    per_pixel = dark_error > 0
+    concentration = plane_concentration(fit_slices)
+    bright, both = concentrated_planes(scores)
+    checks: dict[str, Any] = {
+        "signal": signal,
+        "per_pixel_darkfield": per_pixel,
+        "dark_error_std": dark_error if per_pixel else None,
+        "dark_error_ratio": (
+            dark_error / signal if per_pixel and signal > 0 else None
+        ),
+        "plane_concentration": concentration,
+        "bright_planes": int(bright.sum()),
+        "concentrated_share_of_bright": (
+            float(both.sum() / bright.sum()) if bright.any() else 0.0
+        ),
+        "warnings": [],
+    }
+    warnings = checks["warnings"]
+    if signal <= 0:
+        warnings.append("no signal above the darkfield in the fit planes")
+    elif per_pixel and checks["dark_error_ratio"] > DARK_ERROR_WARN:
+        warnings.append(
+            f"the darkfield matters: it differs from a scalar by "
+            f"{checks['dark_error_ratio']:.0%} of the signal "
+            f"({signal:.1f} counts), and the flatfield error is about the "
+            "darkfield error over the signal, so the darkfield must be "
+            "accurate"
+        )
+    elif not per_pixel and signal < DIM_SIGNAL_WARN:
+        warnings.append(
+            f"dim channel: the signal is {signal:.1f} counts above a scalar "
+            "darkfield, which leaves the camera pattern in the flatfield; "
+            "supply a measured per-pixel darkfield"
+        )
+    if concentration["top_share"] > CONCENTRATION_WARN:
+        warnings.append(
+            f"concentrated signal: the brightest planes hold "
+            f"{concentration['top_share']:.0%} of the fit objective, so the "
+            "flatfield can learn the tissue; consider "
+            "--drop-concentrated-planes"
+        )
+    for message in warnings:
+        logger.warning("  Pre-fit check: %s", message)
+    return checks
 
 
 def select_parameters(
@@ -597,6 +693,13 @@ def estimate_dataset(
     dark_plane = match_darkfield(dark, (stack.height, stack.width))
     # Subtract the darkfield from the stack slices to estimate the flat
     fit_slices, pedestal = subtract_pedestal(stack.slices, dark_plane)
+    scores = plane_scores(fit_slices)
+    checks = prefit_checks(fit_slices, dark_plane, scores)
+    plane_filter: dict[str, Any] = {"enabled": False}
+    if args.drop_concentrated_planes:
+        fit_slices, stack, plane_filter = drop_concentrated_planes(
+            fit_slices, stack, scores
+        )
 
     params, search_report, confirm = select_parameters(
         fit_slices, stack.z_offsets, args, basic_config
@@ -634,6 +737,8 @@ def estimate_dataset(
         "params": result.params,
         "basic_config": basic_config,
         "method": args.method,
+        "checks": checks,
+        "plane_filter": plane_filter,
         "search": search_report,
         "confirm": confirm,
         # The guard's view: the mean-1 field before any rescaling.
@@ -820,6 +925,15 @@ def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
         "index across all tiles, combined with a pixelwise median.",
     )
     parser.add_argument(
+        "--drop-concentrated-planes",
+        action="store_true",
+        help="Before the fit, drop the planes that are bright (mean above "
+        "3x the median plane) and have one dominant bright region (99th "
+        "percentile of the background map above 3x its median), so the "
+        "flatfield does not learn a bright tissue region.  Off by default; "
+        "only with --method fit.",
+    )
+    parser.add_argument(
         "--basic-config",
         type=str,
         default=None,
@@ -951,7 +1065,12 @@ def main(argv: list[str] | None = None) -> None:
     -------
     None
     """
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # The per-Z method fits each Z index across all tiles, so dropping
+    # single planes would leave those groups uneven.
+    if args.drop_concentrated_planes and args.method != "fit":
+        parser.error("--drop-concentrated-planes works only with --method fit")
 
     logging.basicConfig(
         level=logging.INFO,

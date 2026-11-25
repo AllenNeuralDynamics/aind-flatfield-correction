@@ -82,11 +82,11 @@ Named after `--output-name`, or after the last segment of `base_path` if you omi
 
 | Path | Contents |
 |---|---|
-| `flatfield_<name>.npy` | The fitted flatfield, at the estimation pyramid level, scaled so its 99.9th percentile is 1 (see step 6 below) |
+| `flatfield_<name>.npy` | The fitted flatfield, at the estimation pyramid level, scaled so its 99.9th percentile is 1 (see step 8 below) |
 | `flatfield_<name>_level0.npy` | The same flatfield resampled to full resolution, unless `--no-upsample` |
 | `darkfield_<name>.npy` | The darkfield plane that was actually subtracted before fitting |
 | `darkfield_<name>_level0.npy` | The darkfield at full resolution, unless `--no-upsample` |
-| `flatfield_<name>.json` | Sidecar: solver config, chosen parameters, search report, flatfield statistics, the plausibility verdict, the scaling applied, provenance, and the list of tiles used |
+| `flatfield_<name>.json` | Sidecar: solver config, chosen parameters, the pre-fit `checks`, the `plane_filter` record, search report, flatfield statistics, the plausibility verdict, the scaling applied, provenance, and the list of tiles used |
 | `metadata/estimation.log` | The whole run's log |
 | `metadata/tiles_<name>.json` | One record per tile that contributed to the fit |
 | `<name>/*.png` | Inspection figures, only with `--validate` |
@@ -94,6 +94,12 @@ Named after `--output-name`, or after the last segment of `base_path` if you omi
 `darkfield_<name>.npy` holds the pedestal used for the fit rather than BaSiC's own
 darkfield estimate — `get_darkfield` is off, so that estimate is all zeros, and the
 pedestal is what an apply step needs.
+
+Supply a measured darkfield; do not turn `get_darkfield` on to let BaSiC estimate it. On
+dim HCR channels and on SmartSPIM channels BaSiC's own darkfield came out at 0–6 counts
+against a measured camera dark of 90–104, both with the built-in configuration and with
+basicpy's defaults: BaSiC can only separate the darkfield from the flatfield when the
+images span a wide range of brightness, and the tiles of one channel do not.
 
 Both levels are kept for each field: the estimation-level files are what was actually
 fitted and are the reproducible artifacts, while the
@@ -135,19 +141,48 @@ estimation.
    be estimated on the signal alone. Fitting on raw values squashes the apparent
    vignetting by `S / (P + S)` — 14× on a channel whose median raw value is 97 over a
    pedestal of 90 — and yields a near-unity, no-op flatfield.
-3. **Choose `smoothness_flatfield`.** A two-stage search: a cheap screen over a
+3. **Check the fitting stack** (recorded in the sidecar's `checks` block; warnings only).
+   Two conditions were found to decide whether a flatfield is valid:
+   - *The darkfield matters.* The flatfield error is about the darkfield error divided by
+     the signal. With a per-pixel `--darkfield-image`, `dark_error_ratio` is how far it is
+     from a scalar relative to the signal (the median plane mean above the darkfield); above
+     10% the darkfield decides the flatfield and must be accurate. It measured 25–150% on dim
+     HCR channels, whose scalar-darkfield flats were worse than no flatfield, and about 1% on
+     SmartSPIM channels. With a scalar darkfield the error cannot be measured, so a signal
+     below 30 counts is flagged instead.
+   - *The signal is concentrated.* `plane_concentration` reports the share of the fit
+     objective held by the brightest 3.6% of planes (healthy 0.14–0.33; SmartSPIM 561 nm
+     channels with a bright tissue region 0.55–0.63); above 0.45 the flatfield can learn the
+     tissue.
+4. **Optionally drop the bright, concentrated planes** (`--drop-concentrated-planes`, off
+   by default, joint fit only). BaSiC sorts each pixel's values across the images, so its
+   top sorted images are the brightest value any plane has at each pixel. When the bright
+   planes each hold one dominant region, those top images show where the regions are, and
+   the brightness-weighted flatfield update follows them. A plane is dropped when its mean
+   is above 3× the median plane mean **and** the 99th percentile of its background map (a
+   block median, so sparse bright cells do not count) is above 3× the map's median. On a
+   SmartSPIM 561 nm channel fitted per laser side this dropped about 20% of the planes and
+   kept every tile: the largest boost of the flatfield fell from 67× and 358× to 2.6× and
+   2.9×. On healthy channels it dropped 0–6% of the planes and left the flatfield unchanged.
+   Dropping every bright plane instead is harmful: bright tissue that covers the whole view
+   makes the best planes. The sidecar's `plane_filter` block records what was dropped.
+5. **Choose `smoothness_flatfield`.** A two-stage search: a cheap screen over a
    logarithmic grid at reduced solver iterations, then the best few re-scored at full
    fidelity. A calibration gate projects the cost first and abandons the
    search if it would exceed `--max-search-minutes`.
-4. **Confirm at scale.** In ladmap mode `init_mu` depends on N, so a winner found on ~150
+6. **Confirm at scale.** In ladmap mode `init_mu` depends on N, so a winner found on ~150
    slices is refitted against the incumbent on `--n-confirm` slices and reverted unless it
    still leads.
-5. **Fit, then guard.** The accepted flatfield is checked for plausibility — non-finite
-   values, a non-positive minimum, and floors and a ceiling on its standard deviation and
-   span. basicpy normalizes the flatfield mean to 1.0, so those thresholds are scale-free.
+7. **Fit, then guard.** The accepted flatfield is checked for plausibility — non-finite
+   values, a non-positive minimum, floors and a ceiling on its standard deviation and
+   span, and a ceiling of 5× on its largest boost (99.9th percentile over minimum: how many
+   times the correction brightens the darkest part of the flatfield). Accepted flatfields
+   measured 1.4–2.9×; flatfields that learned tissue measured 17–358×, some of them within
+   the standard-deviation limits. basicpy normalizes the flatfield mean to 1.0, so those
+   thresholds are scale-free.
    A field that fails is refitted with the configured baseline; if it still fails, the run
    records it as `"suspicious": true` rather than passing it off as good.
-6. **Scale so the correction does not compress the signal.** An apply step divides by the
+8. **Scale so the correction does not compress the signal.** An apply step divides by the
    flatfield, and dividing by a mean-1 field dims every pixel brighter than the mean — the
    bright centre of the tile, by 9–24% on SmartSPIM and HCR data — while only the edges
    gain. The accepted field is therefore divided by its 99.9th percentile `c`, so applying
@@ -170,7 +205,7 @@ estimation.
    correction went from 8.5 M to 43.7 M (0.34% of the tile); channels well below 65535
    saw none.
 
-7. **Upsample to full resolution.** The fit runs on a downsampled level for speed, but
+9. **Upsample to full resolution.** The fit runs on a downsampled level for speed, but
    the correction is applied to full-resolution voxels, so both fields are resampled up to
    the extent the dataset's own metadata reports for its highest-resolution level. On by default; turn it off with
    `--no-upsample`.
@@ -191,6 +226,7 @@ configuration you supplied.
 | `--darkfield-image` | — | `.npy`/`.tif` darkfield; takes precedence, resized to the estimation level, and a stack of dark frames is averaged to one plane |
 | `--output-folder` | `flatfield_estimation` | Where the products are written |
 | `--method` | `fit` | `fit` is one joint fit; `per-z-median` fits each Z index across all tiles and takes the pixelwise median |
+| `--drop-concentrated-planes` | off | Drop the bright planes with one dominant bright region before the fit (step 4); only with `--method fit` |
 | `--basic-config` | built-in | Solver configuration; see below |
 | `--upsample` / `--no-upsample` | on | Also save both fields resampled to the full-resolution level |
 | `--scale-flatfield` / `--no-scale-flatfield` | on | Save the flatfield with its `--scale-percentile` at 1 instead of its mean, so the correction does not dim the tile centre |
@@ -216,6 +252,9 @@ over** the built-in defaults — only the keys you want to change need to be giv
 The defaults are the vetted values: `ladmap` (which produced the known-good flatfields,
 where `approximate` was a regression), `max_reweight_iterations` raised to 35 from
 basicpy's 10, and `get_darkfield` off because the pedestal is removed beforehand.
+`smoothness_darkfield` and `sparse_cost_darkfield` have no effect while `get_darkfield` is
+off; with it on, the value 20 makes the ladmap solver shrink BaSiC's per-pixel darkfield to
+exactly zero, so only a constant could be learned (see above: do not rely on it).
 
 ```bash
 --basic-config '{"smoothness_flatfield": 2.5}' --skip-search
@@ -239,7 +278,13 @@ acquisition grid:
 - `<name>_overview.png` — the flatfield beside one example plane, raw and corrected.
 - `<name>_vignetting_profiles.png` — X and Y intensity profiles of the mean of every
   fitted plane, before and after correction, with the coefficient of variation of each.
-  A correct flatfield lowers it.
+  A correct flatfield lowers it. The sidecar's `validation` block holds this CV
+  (`cv_{x,y}_{before,after}`) and the **signal CV** (`signal_cv_{x,y}_{before,after}`):
+  the same profiles of the mean of every fitted plane minus the mean of the dimmest 10%,
+  divided by the flatfield. The CV divides by the mean of the corrected image, so a
+  darkfield that is too low makes it look better (a correction that removed no darkfield
+  at all scored 0.06%); in the signal CV the darkfield cancels, so it tests the flatfield
+  alone. Compare runs with different darkfields by the signal CV.
 - `<name>_tile<NNN>_<tile>.png` — per-tile panels for `--validate-tiles` tiles spread
   across the list: raw, X profile, Y profile, corrected, and the change in signal by
   position. The raw curve should be bowed by vignetting and the corrected one flat.
@@ -261,7 +306,8 @@ from pathlib import Path
 
 from aind_flatfield_correction.core.basicpy.config import load_basic_config
 from aind_flatfield_correction.core.basicpy.tiles import (
-    list_tiles, load_darkfield, load_fit_stack, match_darkfield, subtract_pedestal,
+    drop_concentrated_planes, list_tiles, load_darkfield, load_fit_stack,
+    match_darkfield, plane_scores, subtract_pedestal,
 )
 from aind_flatfield_correction.core.basicpy.fit import estimate_joint, report_flatfield
 
@@ -272,6 +318,10 @@ stack = load_fit_stack("s3://bucket/dataset/SPIM/ch_405", tiles, 3, 2000)
 dark = match_darkfield(load_darkfield(None, 90), (stack.height, stack.width))
 fit_slices, _ = subtract_pedestal(stack.slices, dark)
 
+# Optional: drop the bright planes with one dominant region (step 4 above)
+scores = plane_scores(fit_slices)
+fit_slices, stack, dropped = drop_concentrated_planes(fit_slices, stack, scores)
+
 flatfield, _, _ = estimate_joint(fit_slices, basic_config)
 ok, stats, reasons = report_flatfield(flatfield)
 ```
@@ -280,13 +330,13 @@ ok, stats, reasons = report_flatfield(flatfield)
 
 | Module | Responsibility |
 |---|---|
-| `core.basicpy.estimate` | CLI and per-run orchestration |
-| `core.basicpy.tiles` | Tile discovery, plane loading, darkfield handling |
+| `core.basicpy.estimate` | CLI, pre-fit checks and per-run orchestration |
+| `core.basicpy.tiles` | Tile discovery, plane loading, darkfield handling, plane scores and the plane filter |
 | `core.basicpy.search` | The entropy objective and the parameter search |
 | `core.basicpy.fit` | Joint and per-Z fitting, plausibility guard |
 | `core.basicpy.figures` | Inspection figures |
 | `core.basicpy.config` | Solver defaults, thresholds, compute-environment settings |
-| `metrics.metrics` | Coefficient of variation and masked profiles |
+| `metrics.metrics` | Coefficient of variation, masked profiles and the signal CV |
 
 ## Development
 
