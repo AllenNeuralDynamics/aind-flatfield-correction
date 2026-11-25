@@ -464,6 +464,14 @@ class TestMatchDarkfield(unittest.TestCase):
         plane = tiles.match_darkfield(dark, (4, 4))
         np.testing.assert_array_equal(plane, dark)
 
+    def test_averages_an_exact_multiple_over_blocks(self):
+        """A pyramid level is the block mean of full resolution."""
+        dark = np.arange(64, dtype=np.float32).reshape(8, 8)
+        plane = tiles.match_darkfield(dark, (2, 4))
+        expected = dark.reshape(2, 4, 4, 2).mean(axis=(1, 3))
+        np.testing.assert_allclose(plane, expected)
+        self.assertEqual(plane.dtype, np.float32)
+
     def test_resizes_a_full_resolution_image(self):
         """A level-0 darkfield against a downsampled estimation level."""
         dark = np.linspace(0, 100, 64).reshape(8, 8)

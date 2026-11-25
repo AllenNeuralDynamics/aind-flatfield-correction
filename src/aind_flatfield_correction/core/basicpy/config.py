@@ -102,6 +102,27 @@ BG_GRID_BLOCKS = 40
 # for the signal CV.  The darkfield cancels in that difference.
 SIGNAL_LOW_FRACTION = 0.10
 
+# Darkfield from the darkest tiles (``darkmap``).  The darkest plane of the
+# DARKMAP_N_TILES tiles whose darkest plane is darkest: on an HCR channel
+# whose dark planes carried scattered light, this took the flatfield's
+# signal CV from 3.2% (6 fixed tiles) to 1.35%, and 6, 12 or 24 tiles gave
+# the same result within the fit noise (1.31-1.42%).
+DARKMAP_N_TILES = 12
+# Spread (95th - 5th percentile) of the darkest-plane level across tiles
+# above which the dark planes contain light: a camera dark is the same in
+# every tile.  HCR channels with a camera-only dark: 0.7-1.4 counts; a
+# channel whose dark planes carried scattered light: 8.3 counts.
+LIGHT_SPREAD_WARN = 3.0
+# Share of the tiles whose darkest plane is below the darkfield's mean by
+# more than OVER_SUBTRACTED_TOLERANCE counts, above which the darkfield is
+# too high for many tiles and removes real signal there.  6 fixed tiles:
+# 63%; the 12 darkest tiles: 3%.  The tolerance keeps a camera-only dark,
+# whose darkest planes all sit within noise of it, from being counted.
+OVER_SUBTRACTED_WARN = 0.10
+OVER_SUBTRACTED_TOLERANCE = 0.05
+# Pixel step used to measure the mean of every plane when ranking planes.
+LEVEL_SUBSAMPLE = 4
+
 # Percentile of the accepted flatfield that is rescaled to 1.0 before it
 # is saved.  Dividing by basicpy's mean-1 flatfield dims every pixel
 # brighter than the mean -- the tile centre, by 9-24% on SmartSPIM and

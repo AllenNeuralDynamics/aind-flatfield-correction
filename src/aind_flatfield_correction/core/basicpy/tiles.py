@@ -550,6 +550,12 @@ def match_darkfield(
     """
     Broadcast or resize the darkfield onto a ``(height, width)`` plane.
 
+    A full-resolution darkfield that is an exact multiple of the target
+    is averaged over blocks, because a pyramid level is the block mean of
+    full resolution: the camera pattern changes from pixel to pixel, and
+    sampling one pixel per block would subtract noise instead of the
+    pattern the level holds.  Any other size is resized.
+
     Parameters
     ----------
     dark : np.ndarray or float
@@ -565,6 +571,24 @@ def match_darkfield(
     if np.isscalar(dark):
         return np.full(shape, float(dark), dtype=np.float32)
     dark = np.asarray(dark, dtype=np.float32)
+    height, width = shape
+    rows, cols = dark.shape[0] // height, dark.shape[1] // width
+    if (
+        dark.shape != tuple(shape)
+        and rows >= 1
+        and cols >= 1
+        and dark.shape == (rows * height, cols * width)
+    ):
+        logger.info(
+            "  Darkfield averaged over %dx%d blocks %s -> %s for the "
+            "estimation level",
+            rows,
+            cols,
+            dark.shape,
+            tuple(shape),
+        )
+        blocks = dark.reshape(height, rows, width, cols)
+        return blocks.mean(axis=(1, 3), dtype=np.float64).astype(np.float32)
     # Resizing is necessary since we could have a high resolution
     # darkfield image but using a downsampled version for the estimation
     if dark.shape != tuple(shape):

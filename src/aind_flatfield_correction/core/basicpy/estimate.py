@@ -235,7 +235,8 @@ def prefit_checks(
         warnings.append(
             f"dim channel: the signal is {signal:.1f} counts above a scalar "
             "darkfield, which leaves the camera pattern in the flatfield; "
-            "supply a measured per-pixel darkfield"
+            "supply a measured per-pixel darkfield (recorded dark frames, or "
+            "one built with core.basicpy.darkmap)"
         )
     if checks["concentrated_signal"]:
         warnings.append(
