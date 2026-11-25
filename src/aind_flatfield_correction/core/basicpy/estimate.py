@@ -5,6 +5,11 @@ One run fits one multiplicative flatfield from a bounded number of Z
 planes taken from every tile under ``base_path``.  The sensor camera
 offset is removed before fitting.
 
+The saved flatfield is rescaled so that its 99.9th percentile
+(``--scale-percentile``), rather than its mean, is 1.0: dividing by
+basicpy's mean-1 field would dim the bright centre of every tile.
+``--no-scale-flatfield`` keeps the mean-1 field.
+
 ``base_path`` is one channel's folder: nothing is inferred from the tile
 names, so to estimate several channels the command is run once per
 channel folder.  ``--tile-pattern`` optionally narrows the run to a
@@ -56,9 +61,12 @@ import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from matplotlib.image import imsave
+
 import numpy as np
 
 from aind_flatfield_correction.core.basicpy.config import (
+    FLAT_SCALE_PERCENTILE,
     baseline_params,
     load_basic_config,
 )
@@ -69,6 +77,7 @@ from aind_flatfield_correction.core.basicpy.fit import (
     estimate_joint,
     estimate_per_z_median,
     report_flatfield,
+    scale_flatfield,
     validate_basic_config,
 )
 from aind_flatfield_correction.core.basicpy.search import (
@@ -283,6 +292,57 @@ def fit_with_guard(
     return FitResult(flatfield, darkfield, n_z_ok, params, ok, stats, reasons)
 
 
+def apply_flatfield_scaling(
+    result: FitResult, args: argparse.Namespace
+) -> tuple[FitResult, dict[str, Any]]:
+    """
+    Rescale the accepted flatfield so the correction stops dimming.
+
+    Runs after the guard, which judged basicpy's mean-1 field on the
+    thresholds calibrated for it; ``result.stats`` keep describing that
+    field.  Everything downstream -- the saved arrays, the upsampled
+    field and the figures -- gets the rescaled one.
+
+    A flatfield that cannot be scaled is kept as fitted rather than
+    failing the run after a long fit: the guard has already marked it
+    suspicious, and the record says why it was left unscaled.
+
+    Parameters
+    ----------
+    result : FitResult
+        The fit accepted by the guard.
+    args : argparse.Namespace
+        Parsed command-line arguments.
+
+    Returns
+    -------
+    tuple of (FitResult, dict)
+        The result carrying the flatfield to save, and the scaling
+        record for the sidecar.
+    """
+    if not args.scale_flatfield:
+        logger.info("  Flatfield kept at mean 1 (--no-scale-flatfield)")
+        return result, {"applied": False, "reason": "--no-scale-flatfield"}
+    try:
+        scaled, record = scale_flatfield(
+            result.flatfield, args.scale_percentile
+        )
+    except ValueError as error:
+        logger.warning("  Flatfield left at mean 1: %s", error)
+        return result, {"applied": False, "reason": str(error)}
+    logger.info(
+        "  Flatfield scaled so its %gth percentile is 1 (divided by %.4f): "
+        "signal lowered on %.2f%% of pixels, by at most %.2f%%; "
+        "boosted by at most %.1f%%",
+        record["percentile"],
+        record["scale"],
+        100.0 * record["frac_pixels_reduced"],
+        record["max_reduction_pct"],
+        record["max_boost_pct"],
+    )
+    return result._replace(flatfield=scaled), {"applied": True, **record}
+
+
 def write_tile_manifest(
     label: str, output_folder: Path, stack: FitStack
 ) -> str:
@@ -380,7 +440,8 @@ def upsample_to_full_resolution(
     output_folder : Path
         Folder to write into.
     flatfield : np.ndarray
-        The fitted flatfield, at the estimation level.
+        The fitted flatfield, at the estimation level, already rescaled
+        when scaling is on: the same factor then holds at both levels.
     dark : np.ndarray or float
         The darkfield as supplied: an image at its own resolution, or a
         scalar pedestal.
@@ -401,10 +462,18 @@ def upsample_to_full_resolution(
     flat_full = resize_plane(flatfield, shape)
     flat_path = output_folder / f"flatfield_{label}{suffix}"
     np.save(flat_path, flat_full)
+    imsave(
+        flat_path.with_suffix(".png"),
+        flat_full,
+        cmap="coolwarm",
+        vmin=0.4,
+        vmax=1.6,
+    )
 
     dark_full = match_darkfield(dark, shape)
     dark_path = output_folder / f"darkfield_{label}{suffix}"
     np.save(dark_path, dark_full)
+    imsave(dark_path.with_suffix(".png"), dark_full, cmap="gray")
 
     factor = shape[0] / flatfield.shape[0] if flatfield.shape[0] else None
     logger.info(
@@ -540,6 +609,7 @@ def estimate_dataset(
         (search_report or {}).get("baseline_std"),
         basic_config,
     )
+    result, scaling = apply_flatfield_scaling(result, args)
 
     validation = _write_products(
         label, output_folder, result, dark_plane, stack, tile_names, args
@@ -566,8 +636,10 @@ def estimate_dataset(
         "method": args.method,
         "search": search_report,
         "confirm": confirm,
+        # The guard's view: the mean-1 field before any rescaling.
         "flatfield_stats": result.stats,
         "guard": {"ok": bool(result.ok), "reasons": result.reasons},
+        "scaling": scaling,
         "suspicious": (not result.ok),
         "n_tiles": len(tile_names),
         "planes_per_tile": int(stack.n_planes),
@@ -629,6 +701,39 @@ def default_label(base_path: str) -> str:
     if not segments:
         return "flatfield"
     return re.sub(r"[^A-Za-z0-9._-]+", "_", segments[-1]).strip("_")
+
+
+def _percentile(text: str) -> float:
+    """
+    Parse a percentile argument, rejecting values outside (0, 100].
+
+    Checked at parse time so that a typo fails before the tile load
+    rather than after the fit.
+
+    Parameters
+    ----------
+    text : str
+        The value as given on the command line.
+
+    Returns
+    -------
+    float
+        The percentile.
+
+    Raises
+    ------
+    argparse.ArgumentTypeError
+        If the value is not a number in (0, 100].
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not 0.0 < value <= 100.0:
+        raise argparse.ArgumentTypeError(
+            f"percentile must be in (0, 100], got {value:g}"
+        )
+    return value
 
 
 def _add_data_arguments(parser: argparse.ArgumentParser) -> None:
@@ -742,6 +847,23 @@ def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
         "estimation pyramid level up to the full-resolution level, "
         "whose extent is read from the dataset metadata (default: on; "
         "disable with --no-upsample).",
+    )
+    parser.add_argument(
+        "--scale-flatfield",
+        dest="scale_flatfield",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Rescale the saved flatfield so that its --scale-percentile, "
+        "rather than its mean, is 1.0, so that dividing by it no longer "
+        "dims the bright centre of the tile (default: on; keep basicpy's "
+        "mean-1 flatfield with --no-scale-flatfield).",
+    )
+    parser.add_argument(
+        "--scale-percentile",
+        type=_percentile,
+        default=FLAT_SCALE_PERCENTILE,
+        help="Percentile of the flatfield that --scale-flatfield maps to "
+        f"1.0, in (0, 100] (default {FLAT_SCALE_PERCENTILE:g}).",
     )
     parser.add_argument(
         "--validate",

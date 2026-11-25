@@ -118,21 +118,96 @@ class TestListTiles(unittest.TestCase):
 
 
 class TestOpenTile(unittest.TestCase):
-    """Opening a tile as a 3-D array."""
+    """Opening a tile as a 3-D array, across zarr versions."""
+
+    def _reader(self, values=None):
+        """
+        Build a reader whose array has leading singleton axes.
+
+        Parameters
+        ----------
+        values : np.ndarray, optional
+            Array to serve; defaults to a 5-D ``(1, 1, 4, 8, 8)`` stack.
+
+        Returns
+        -------
+        MagicMock
+            A stand-in for an OMEZarrReader instance.
+        """
+        if values is None:
+            values = np.zeros((1, 1, 4, 8, 8), dtype=np.float32)
+        reader = MagicMock()
+        reader.as_dask_array.return_value = LazyArray(values)
+        return reader
 
     def test_drops_leading_singleton_axes(self):
         """OME-Zarr tiles arrive as (t, c, z, y, x)."""
-        values = np.zeros((1, 1, 4, 8, 8), dtype=np.float32)
-        reader = MagicMock()
-        reader.as_dask_array.return_value = LazyArray(values)
-        with patch.object(tiles, "OMEZarrReader", return_value=reader) as ctor:
+        with patch.object(
+            tiles, "OMEZarrReader", return_value=self._reader()
+        ) as ctor:
             arr = tiles.open_tile("s3://bucket/ch/", CH405, 3)
         self.assertEqual(arr.shape, (4, 8, 8))
         ctor.assert_called_once_with(
             data_path=f"s3://bucket/ch/{CH405}",
             multiscale="3",
+            zarr_version=tiles.ZARR_VERSIONS[0],
+        )
+
+    def test_falls_back_to_the_next_zarr_version(self):
+        """Some datasets open only as v2 and others only as v3.
+
+        The v2 reader surfaces a mismatched store as TypeError rather
+        than ValueError, which once aborted the whole search on the
+        first attempt.
+        """
+        with patch.object(
+            tiles,
+            "OMEZarrReader",
+            side_effect=[TypeError("shape is None"), self._reader()],
+        ) as ctor:
+            arr = tiles.open_tile("/data", CH405, 3)
+        self.assertEqual(arr.shape, (4, 8, 8))
+        self.assertEqual(ctor.call_count, 2)
+        self.assertEqual(
+            ctor.call_args_list[1].kwargs["zarr_version"],
+            tiles.ZARR_VERSIONS[1],
+        )
+
+    def test_raises_when_no_version_can_read_the_tile(self):
+        """A tile no version can read is a real problem."""
+        with patch.object(
+            tiles,
+            "OMEZarrReader",
+            side_effect=TypeError("shape is None"),
+        ) as ctor:
+            with self.assertRaises(ValueError) as caught:
+                tiles.open_tile("/data", CH405, 3)
+        self.assertEqual(ctor.call_count, len(tiles.ZARR_VERSIONS))
+        self.assertIn(CH405, str(caught.exception))
+
+    def test_honours_an_explicit_zarr_version(self):
+        """A caller who knows the format skips the search."""
+        with patch.object(
+            tiles, "OMEZarrReader", return_value=self._reader()
+        ) as ctor:
+            tiles.open_tile("/data", CH405, 0, zarr_version="3.0")
+        ctor.assert_called_once_with(
+            data_path=f"/data/{CH405}",
+            multiscale="0",
             zarr_version="3.0",
         )
+
+    def test_reports_a_failing_explicit_version(self):
+        """No fallback when the version was asked for by name."""
+        with patch.object(
+            tiles, "OMEZarrReader", side_effect=TypeError("shape is None")
+        ) as ctor:
+            with self.assertRaises(ValueError) as caught:
+                tiles.open_tile("/data", CH405, 3, zarr_version="2.0")
+        self.assertEqual(ctor.call_count, 1)
+        self.assertIn("2.0", str(caught.exception))
+        # The original failure stays attached for diagnosis.
+        self.assertIsInstance(caught.exception.__cause__, TypeError)
 
 
 class TestPickZPlanes(unittest.TestCase):

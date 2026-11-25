@@ -18,6 +18,7 @@ from aind_flatfield_correction.core.basicpy.config import (
     FF_SPAN_FLOOR,
     FF_STD_CEILING,
     FF_STD_FLOOR,
+    FLAT_SCALE_PERCENTILE,
     limit_worker_threads,
     worker_pool_size,
 )
@@ -361,6 +362,65 @@ def check_flatfield_plausibility(
             f"std {baseline_std:.4f}"
         )
     return (not reasons), stats, reasons
+
+
+def scale_flatfield(
+    flatfield: np.ndarray, percentile: float = FLAT_SCALE_PERCENTILE
+) -> tuple[np.ndarray, dict[str, float]]:
+    """
+    Rescale a flatfield so that a high percentile, not its mean, is 1.
+
+    basicpy normalizes the flatfield to a mean of 1, so dividing by it
+    lowers every pixel brighter than the mean: the bright centre of the
+    tile loses signal and only the dim edges gain.  Dividing by
+    ``flatfield / c`` instead, with ``c`` the flatfield's ``percentile``,
+    is the mean-1 correction multiplied by ``c``.  The vignetting shape
+    is unchanged, but only the pixels above that percentile keep a gain
+    below 1, so the correction no longer compresses the signal.
+
+    Parameters
+    ----------
+    flatfield : np.ndarray
+        Fitted flatfield.
+    percentile : float, optional
+        Percentile of the flatfield mapped to 1.0, in (0, 100], by
+        default :data:`FLAT_SCALE_PERCENTILE`.
+
+    Returns
+    -------
+    tuple of (np.ndarray, dict)
+        The scaled float32 flatfield, and a record of the scaling: the
+        percentile, the scale factor ``c`` divided out, the fraction of
+        pixels whose signal the correction still lowers, and the largest
+        reduction and boost it applies, in percent.
+
+    Raises
+    ------
+    ValueError
+        If ``percentile`` is outside (0, 100], or the flatfield has
+        non-finite or non-positive values, which no scale factor can
+        make into a usable gain.
+    """
+    if not 0.0 < percentile <= 100.0:
+        raise ValueError(f"percentile must be in (0, 100], got {percentile}")
+    flat = np.asarray(flatfield, dtype=np.float32)
+    if not np.isfinite(flat).all() or flat.min() <= 0:
+        raise ValueError(
+            "flatfield has non-finite or non-positive values, so it "
+            "cannot be scaled"
+        )
+    scale = float(np.percentile(flat, percentile))
+    scaled = flat / np.float32(scale)
+    # The correction divides by the flatfield, so its gain is 1 / scaled.
+    gain = 1.0 / scaled.astype(np.float64)
+    record = {
+        "percentile": float(percentile),
+        "scale": scale,
+        "frac_pixels_reduced": float((gain < 1.0).mean()),
+        "max_reduction_pct": float(100.0 * max(0.0, 1.0 - gain.min())),
+        "max_boost_pct": float(100.0 * (gain.max() - 1.0)),
+    }
+    return scaled, record
 
 
 def report_flatfield(

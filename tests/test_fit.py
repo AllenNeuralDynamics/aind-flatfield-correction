@@ -274,6 +274,58 @@ class TestCheckFlatfieldPlausibility(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class TestScaleFlatfield(unittest.TestCase):
+    """Rescaling so the correction stops dimming the tile centre."""
+
+    def test_maps_the_percentile_to_one(self):
+        """The 99.9th percentile of the saved field is exactly 1."""
+        scaled, record = fit.scale_flatfield(_plausible(100, 100))
+        self.assertAlmostEqual(
+            float(np.percentile(scaled, 99.9)), 1.0, places=5
+        )
+        self.assertEqual(record["percentile"], 99.9)
+        self.assertEqual(scaled.dtype, np.float32)
+
+    def test_keeps_the_vignetting_shape(self):
+        """Only a constant factor changes, so the CV and profiles hold."""
+        flat = _plausible(100, 100)
+        scaled, record = fit.scale_flatfield(flat)
+        np.testing.assert_allclose(scaled * record["scale"], flat, rtol=1e-6)
+
+    def test_lowers_the_signal_on_almost_no_pixel(self):
+        """A mean-1 field dims half the tile; the scaled one 0.1%."""
+        flat = _plausible(100, 100)
+        self.assertAlmostEqual(float((flat > 1.0).mean()), 0.5, places=2)
+        _, record = fit.scale_flatfield(flat)
+        self.assertLessEqual(record["frac_pixels_reduced"], 0.0011)
+        self.assertLess(record["max_reduction_pct"], 0.1)
+
+    def test_reports_the_largest_boost(self):
+        """At the 100th percentile the dimmest pixel gains max / min."""
+        _, record = fit.scale_flatfield(_plausible(span=0.5), 100.0)
+        self.assertEqual(record["frac_pixels_reduced"], 0.0)
+        self.assertEqual(record["max_reduction_pct"], 0.0)
+        self.assertAlmostEqual(
+            record["max_boost_pct"], 100.0 * (1.25 / 0.75 - 1.0), places=3
+        )
+
+    def test_rejects_a_percentile_out_of_range(self):
+        """0 would divide by the minimum's floor; above 100 is undefined."""
+        for percentile in (0.0, -5.0, 100.5):
+            with self.subTest(percentile=percentile):
+                with self.assertRaises(ValueError):
+                    fit.scale_flatfield(_plausible(), percentile)
+
+    def test_rejects_a_field_no_factor_can_fix(self):
+        """A NaN or a zero stays broken whatever it is divided by."""
+        for bad in (np.nan, 0.0, -0.5):
+            flat = _plausible()
+            flat[0, 0] = bad
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    fit.scale_flatfield(flat)
+
+
 class TestReportFlatfield(unittest.TestCase):
     """The logging wrapper around the guard."""
 

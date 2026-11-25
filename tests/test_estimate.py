@@ -178,6 +178,31 @@ class TestBuildParser(unittest.TestCase):
                         ["/data", "--method", "magic"]
                     )
 
+    def test_scales_the_flatfield_by_default(self):
+        """The fix for signal compression is on unless turned off."""
+        args = estimate.build_parser().parse_args(["/data/ch_405"])
+        self.assertTrue(args.scale_flatfield)
+        self.assertEqual(args.scale_percentile, 99.9)
+
+    def test_scaling_can_be_turned_off_or_retargeted(self):
+        """--no-scale-flatfield keeps the mean-1 field."""
+        args = estimate.build_parser().parse_args(
+            ["/data", "--no-scale-flatfield", "--scale-percentile", "99"]
+        )
+        self.assertFalse(args.scale_flatfield)
+        self.assertEqual(args.scale_percentile, 99.0)
+
+    def test_rejects_an_unusable_percentile(self):
+        """Caught at parse time, not after the fit."""
+        for value in ("0", "100.5", "-1", "high"):
+            with self.subTest(value=value):
+                with open(os.devnull, "w") as devnull:
+                    with contextlib.redirect_stderr(devnull):
+                        with self.assertRaises(SystemExit):
+                            estimate.build_parser().parse_args(
+                                ["/data", "--scale-percentile", value]
+                            )
+
 
 class TestSelectParameters(unittest.TestCase):
     """Choosing the smoothness for the final fit."""
@@ -394,6 +419,79 @@ class TestFitWithGuard(unittest.TestCase):
         self.assertTrue(result.reasons)
 
 
+class TestApplyFlatfieldScaling(unittest.TestCase):
+    """Rescaling the accepted flatfield after the guard."""
+
+    def _result(self, flatfield):
+        """
+        Build a fit result around a given flatfield.
+
+        Parameters
+        ----------
+        flatfield : np.ndarray
+            The flatfield the result carries.
+
+        Returns
+        -------
+        estimate.FitResult
+            A result with the guard's stats of the mean-1 field.
+        """
+        return estimate.FitResult(
+            flatfield,
+            np.zeros(flatfield.shape),
+            None,
+            baseline_params(BASIC_CONFIG),
+            True,
+            {"mean": 1.0},
+            [],
+        )
+
+    def test_rescales_the_flatfield(self):
+        """The saved field's percentile is 1; the guard's stats stay."""
+        flat = _plausible()
+        result, record = estimate.apply_flatfield_scaling(
+            self._result(flat), _args()
+        )
+        self.assertTrue(record["applied"])
+        self.assertAlmostEqual(
+            record["scale"], float(np.percentile(flat, 99.9)), places=6
+        )
+        self.assertAlmostEqual(
+            float(np.percentile(result.flatfield, 99.9)), 1.0, places=5
+        )
+        self.assertEqual(result.stats, {"mean": 1.0})
+
+    def test_honours_the_requested_percentile(self):
+        """--scale-percentile picks which value becomes 1."""
+        result, record = estimate.apply_flatfield_scaling(
+            self._result(_plausible()), _args(scale_percentile=100.0)
+        )
+        self.assertAlmostEqual(float(result.flatfield.max()), 1.0, places=6)
+        self.assertEqual(record["percentile"], 100.0)
+
+    def test_leaves_the_field_alone_when_disabled(self):
+        """--no-scale-flatfield restores the mean-1 output."""
+        flat = _plausible()
+        result, record = estimate.apply_flatfield_scaling(
+            self._result(flat), _args(scale_flatfield=False)
+        )
+        self.assertIs(result.flatfield, flat)
+        self.assertEqual(
+            record, {"applied": False, "reason": "--no-scale-flatfield"}
+        )
+
+    def test_keeps_an_unscalable_field_rather_than_failing(self):
+        """A broken field is already suspicious; the run still finishes."""
+        flat = _plausible()
+        flat[0, 0] = np.nan
+        result, record = estimate.apply_flatfield_scaling(
+            self._result(flat), _args()
+        )
+        self.assertIs(result.flatfield, flat)
+        self.assertFalse(record["applied"])
+        self.assertIn("cannot be scaled", record["reason"])
+
+
 class TestWriteProducts(unittest.TestCase):
     """Saving the arrays and the figures."""
 
@@ -494,10 +592,12 @@ class TestEstimateDataset(unittest.TestCase):
             The sidecar that was written.
         """
         args = _args(
-            skip_search=True,
-            validate=False,
-            darkfield_value=90.0,
-            **overrides,
+            **{
+                "skip_search": True,
+                "validate": False,
+                "darkfield_value": 90.0,
+                **overrides,
+            }
         )
         with patch.object(estimate, "load_fit_stack", return_value=_stack()):
             with patch.object(
@@ -528,9 +628,11 @@ class TestEstimateDataset(unittest.TestCase):
             [
                 "darkfield_ch_405.npy",
                 "darkfield_ch_405_level0.npy",
+                "darkfield_ch_405_level0.png",
                 "flatfield_ch_405.json",
                 "flatfield_ch_405.npy",
                 "flatfield_ch_405_level0.npy",
+                "flatfield_ch_405_level0.png",
                 "metadata",
             ],
         )
@@ -623,6 +725,44 @@ class TestEstimateDataset(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._run(tmp)
             json.loads((Path(tmp) / "flatfield_ch_405.json").read_text())
+
+    def test_saves_the_scaled_flatfield_at_both_levels(self):
+        """One factor for both files, so they stay each other's twin."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp)
+            estimated = np.load(Path(tmp) / "flatfield_ch_405.npy")
+            upsampled = np.load(Path(tmp) / "flatfield_ch_405_level0.npy")
+        scale = float(np.percentile(_plausible(), 99.9))
+        np.testing.assert_allclose(estimated, _plausible() / scale, rtol=1e-6)
+        self.assertAlmostEqual(
+            float(upsampled.max()), float(estimated.max()), places=5
+        )
+        self.assertTrue(sidecar["scaling"]["applied"])
+        self.assertAlmostEqual(sidecar["scaling"]["scale"], scale, places=6)
+
+    def test_the_guard_stats_describe_the_mean_one_field(self):
+        """The thresholds were calibrated on basicpy's normalization."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp)
+        self.assertAlmostEqual(sidecar["flatfield_stats"]["mean"], 1.0, 5)
+
+    def test_saves_the_mean_one_field_when_scaling_is_off(self):
+        """--no-scale-flatfield writes what basicpy fitted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp, scale_flatfield=False)
+            estimated = np.load(Path(tmp) / "flatfield_ch_405.npy")
+        np.testing.assert_array_equal(estimated, _plausible())
+        self.assertFalse(sidecar["scaling"]["applied"])
+
+    def test_the_figures_show_the_scaled_flatfield(self):
+        """They should show what an apply step will actually do."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                estimate, "save_validation_figures", return_value={}
+            ) as plotter:
+                self._run(tmp, validate=True)
+        shown = plotter.call_args.args[1]
+        self.assertAlmostEqual(float(np.percentile(shown, 99.9)), 1.0, 5)
 
 
 class TestUpsampleToFullResolution(unittest.TestCase):
