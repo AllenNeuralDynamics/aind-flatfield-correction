@@ -150,12 +150,21 @@ estimation.
      HCR channels, whose scalar-darkfield flats were worse than no flatfield, and about 1% on
      SmartSPIM channels. With a scalar darkfield the error cannot be measured, so a signal
      below 30 counts is flagged instead.
-   - *The signal is concentrated.* `plane_concentration` reports the share of the fit
-     objective held by the brightest 3.6% of planes (healthy 0.14–0.33; SmartSPIM 561 nm
-     channels with a bright tissue region 0.55–0.63); above 0.45 the flatfield can learn the
-     tissue.
-4. **Optionally drop the bright, concentrated planes** (`--drop-concentrated-planes`, off
-   by default, joint fit only). BaSiC sorts each pixel's values across the images, so its
+   - *The signal is concentrated.* The check fires on either of two signs, and records its
+     verdict as `concentrated_signal`:
+     - `plane_concentration`: the brightest 3.6% of planes hold more than 45% of the fit
+       objective (healthy 0.14–0.33; SmartSPIM 561 nm channels with a bright tissue region
+       0.55–0.63);
+     - `concentrated_fraction`: more than 10% of all planes are bright and have one dominant
+       bright region (step 4). This catches stacks in which so many planes are affected that
+       the brightest few hold only a modest share of the objective: a synthetic stack with a
+       bright region in 30% of its planes scored 0.15 on the first sign and 0.33 on this one.
+
+     Either way the flatfield can learn the tissue.
+4. **Drop the bright, concentrated planes when step 3 finds concentrated signal**
+   (`--drop-concentrated-planes`, off by default, joint fit only). With the flag on, planes
+   are dropped only when the concentrated-signal check fires; otherwise every plane is kept,
+   so the flag is safe on healthy channels. BaSiC sorts each pixel's values across the images, so its
    top sorted images are the brightest value any plane has at each pixel. When the bright
    planes each hold one dominant region, those top images show where the regions are, and
    the brightness-weighted flatfield update follows them. A plane is dropped when its mean
@@ -163,9 +172,10 @@ estimation.
    block median, so sparse bright cells do not count) is above 3× the map's median. On a
    SmartSPIM 561 nm channel fitted per laser side this dropped about 20% of the planes and
    kept every tile: the largest boost of the flatfield fell from 67× and 358× to 2.6× and
-   2.9×. On healthy channels it dropped 0–6% of the planes and left the flatfield unchanged.
-   Dropping every bright plane instead is harmful: bright tissue that covers the whole view
-   makes the best planes. The sidecar's `plane_filter` block records what was dropped.
+   2.9×. On healthy channels the check does not fire and every plane is kept. Dropping every
+   bright plane instead is harmful: bright tissue that covers the whole view makes the best
+   planes. The sidecar's `plane_filter` block records whether the filter was `enabled` and
+   `applied` (or the `reason` it was not), and what was dropped per tile.
 5. **Choose `smoothness_flatfield`.** A two-stage search: a cheap screen over a
    logarithmic grid at reduced solver iterations, then the best few re-scored at full
    fidelity. A calibration gate projects the cost first and abandons the
@@ -226,7 +236,7 @@ configuration you supplied.
 | `--darkfield-image` | — | `.npy`/`.tif` darkfield; takes precedence, resized to the estimation level, and a stack of dark frames is averaged to one plane |
 | `--output-folder` | `flatfield_estimation` | Where the products are written |
 | `--method` | `fit` | `fit` is one joint fit; `per-z-median` fits each Z index across all tiles and takes the pixelwise median |
-| `--drop-concentrated-planes` | off | Drop the bright planes with one dominant bright region before the fit (step 4); only with `--method fit` |
+| `--drop-concentrated-planes` | off | When the step-3 check finds concentrated signal, drop the bright planes with one dominant bright region before the fit (step 4); healthy channels keep every plane; only with `--method fit` |
 | `--basic-config` | built-in | Solver configuration; see below |
 | `--upsample` / `--no-upsample` | on | Also save both fields resampled to the full-resolution level |
 | `--scale-flatfield` / `--no-scale-flatfield` | on | Save the flatfield with its `--scale-percentile` at 1 instead of its mean, so the correction does not dim the tile centre |
