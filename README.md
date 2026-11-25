@@ -22,7 +22,8 @@ We estimate the flatfields by smartly selecting slices from each tile in the dat
 
 This is the result after applying flatfield to the tiles of a proteomics dataset.
 ![Example Flatfield](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/flatfield_corrected.png?raw=true)
-![Example Flatfield Distribution](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/plot_distribution.png?raw=true)
+The saved flatfield is scaled so that the correction brightens the dim edges of a tile
+without dimming its bright centre (see [Signal compression](#signal-compression)).
 
 Two kinds of channel need extra care, and each has its own section below:
 [dim channels](#building-a-darkfield-for-dim-channels), where the darkfield decides the
@@ -204,7 +205,8 @@ estimation.
    thresholds are scale-free.
    A field that fails is refitted with the configured baseline; if it still fails, the run
    records it as `"suspicious": true` rather than passing it off as good.
-8. **Scale so the correction does not compress the signal.** An apply step divides by the
+8. **Scale so the correction does not compress the signal** (example in
+   [Signal compression](#signal-compression)). An apply step divides by the
    flatfield, and dividing by a mean-1 field dims every pixel brighter than the mean — the
    bright centre of the tile, by 9–24% on SmartSPIM and HCR data — while only the edges
    gain. The accepted field is therefore divided by its 99.9th percentile `c`, so applying
@@ -343,6 +345,40 @@ keeps the raw range:
 The flag is off by default and works only with `--method fit`. When the check finds no
 concentrated signal it keeps every plane, so it is safe to leave on for a whole dataset.
 The sidecar's `plane_filter` block records what was dropped per tile.
+
+## Signal compression
+
+basicpy normalizes the flatfield to a mean of 1. Dividing by it lowers every pixel where
+the flatfield is above 1, which is the bright centre of the tile, and raises only the dim
+edges. Applied to a whole dataset, this compresses the signal: on one HCR dataset the
+centre of every tile lost 11–14% of its signal, depending on the channel.
+
+The saved flatfield is therefore divided by a constant `c` so that the correction raises
+the edges to the level of the centre instead of pulling the centre down. Applying it
+computes `(raw − dark) · c / flatfield`. The vignetting shape, and so the flatness of the
+result, does not change; only the overall level does.
+
+The figure below is the per-tile figure `--validate` writes, for one tile of an HCR
+514 nm channel corrected with the default scaling (`c` = 1.153, the flatfield's 99.9th
+percentile; darkfield 90). The last panel shows the change in signal by position, and
+nothing is shaded red, so no part of the tile lost signal. From top to bottom, the centre
+stays close to its raw value (+3%) and the edges gain up to +65%, which is the vignetting
+being corrected. From left to right, where this flatfield varies less, every position
+gains 13–21%.
+
+![Per-tile validation figure for a scaled flatfield](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/plot_distribution.png?raw=true)
+
+Because `c` maps a high percentile rather than the centre to 1, the whole tile, the
+centre included, ends up slightly above raw. Step 8 of [How it works](#how-it-works) gives
+the numbers, including the effect on channels close to saturation.
+
+The scaling is on by default:
+
+- `--scale-percentile` sets which percentile of the flatfield is mapped to 1. A lower
+  value keeps the centre closer to raw, at the cost of dimming the pixels above it.
+- `--no-scale-flatfield` saves basicpy's mean-1 flatfield unchanged.
+- The sidecar's `scaling` block records `c`, the fraction of pixels still dimmed, and the
+  largest reduction and boost.
 
 ## Options
 
