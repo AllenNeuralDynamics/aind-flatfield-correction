@@ -76,6 +76,13 @@ DIM_SIGNAL_WARN = 30.0
 # (``tiles.plane_concentration``) above which the signal is concentrated:
 # healthy channels 0.14-0.33, SmartSPIM 561 0.55-0.63.
 CONCENTRATION_WARN = 0.45
+# Second sign of concentrated signal, for stacks in which many planes are
+# affected, so that the brightest few hold only a modest share of the
+# objective: the share of all planes that are bright and concentrated
+# (``tiles.concentrated_planes``).  SmartSPIM 561: about 20% per laser
+# side; healthy channels 0-6%; a synthetic stack with a bright region in
+# 30% of its images: 28%, while its top-plane share was only 0.15.
+CONCENTRATED_PLANES_WARN = 0.10
 
 # Plane filter (--drop-concentrated-planes).  A plane is dropped when it is
 # bright, its mean above BRIGHT_RATIO x the median plane mean, AND

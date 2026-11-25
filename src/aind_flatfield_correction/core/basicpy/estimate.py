@@ -66,6 +66,7 @@ from matplotlib.image import imsave
 import numpy as np
 
 from aind_flatfield_correction.core.basicpy.config import (
+    CONCENTRATED_PLANES_WARN,
     CONCENTRATION_WARN,
     DARK_ERROR_WARN,
     DIM_SIGNAL_WARN,
@@ -166,8 +167,14 @@ def prefit_checks(
       is flagged instead: the camera pattern a scalar leaves behind is then
       a large part of the signal.
     * **The signal is concentrated.**  When the brightest planes hold more
-      than :data:`CONCENTRATION_WARN` of the fit objective, the flatfield
-      can learn the tissue (see :func:`tiles.drop_concentrated_planes`).
+      than :data:`CONCENTRATION_WARN` of the fit objective, or when more
+      than :data:`CONCENTRATED_PLANES_WARN` of all planes are bright and
+      have one dominant bright region, the flatfield can learn the tissue
+      (see :func:`tiles.drop_concentrated_planes`).  The second sign
+      catches stacks in which so many planes are affected that the
+      brightest few hold only a modest share of the objective.
+      ``concentrated_signal`` records the verdict; with
+      ``--drop-concentrated-planes`` it decides whether planes are dropped.
 
     The checks only warn and are recorded in the sidecar; nothing is
     refused.
@@ -192,6 +199,7 @@ def prefit_checks(
     per_pixel = dark_error > 0
     concentration = plane_concentration(fit_slices)
     bright, both = concentrated_planes(scores)
+    concentrated_fraction = float(both.mean()) if both.size else 0.0
     checks: dict[str, Any] = {
         "signal": signal,
         "per_pixel_darkfield": per_pixel,
@@ -203,6 +211,12 @@ def prefit_checks(
         "bright_planes": int(bright.sum()),
         "concentrated_share_of_bright": (
             float(both.sum() / bright.sum()) if bright.any() else 0.0
+        ),
+        "concentrated_planes": int(both.sum()),
+        "concentrated_fraction": concentrated_fraction,
+        "concentrated_signal": bool(
+            concentration["top_share"] > CONCENTRATION_WARN
+            or concentrated_fraction > CONCENTRATED_PLANES_WARN
         ),
         "warnings": [],
     }
@@ -223,12 +237,13 @@ def prefit_checks(
             "darkfield, which leaves the camera pattern in the flatfield; "
             "supply a measured per-pixel darkfield"
         )
-    if concentration["top_share"] > CONCENTRATION_WARN:
+    if checks["concentrated_signal"]:
         warnings.append(
             f"concentrated signal: the brightest planes hold "
-            f"{concentration['top_share']:.0%} of the fit objective, so the "
-            "flatfield can learn the tissue; consider "
-            "--drop-concentrated-planes"
+            f"{concentration['top_share']:.0%} of the fit objective and "
+            f"{concentrated_fraction:.0%} of the planes are bright with one "
+            "dominant region, so the flatfield can learn the tissue; "
+            "--drop-concentrated-planes drops those planes"
         )
     for message in warnings:
         logger.warning("  Pre-fit check: %s", message)
@@ -695,10 +710,22 @@ def estimate_dataset(
     fit_slices, pedestal = subtract_pedestal(stack.slices, dark_plane)
     scores = plane_scores(fit_slices)
     checks = prefit_checks(fit_slices, dark_plane, scores)
-    plane_filter: dict[str, Any] = {"enabled": False}
-    if args.drop_concentrated_planes:
-        fit_slices, stack, plane_filter = drop_concentrated_planes(
+    plane_filter: dict[str, Any] = {
+        "enabled": bool(args.drop_concentrated_planes),
+        "applied": False,
+    }
+    if args.drop_concentrated_planes and checks["concentrated_signal"]:
+        fit_slices, stack, report = drop_concentrated_planes(
             fit_slices, stack, scores
+        )
+        plane_filter.update(report, applied=True)
+    elif args.drop_concentrated_planes:
+        plane_filter["reason"] = (
+            "the pre-fit check found no concentrated signal"
+        )
+        logger.info(
+            "  Plane filter: on, but the pre-fit check found no concentrated "
+            "signal - every plane is kept"
         )
 
     params, search_report, confirm = select_parameters(
@@ -927,11 +954,12 @@ def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--drop-concentrated-planes",
         action="store_true",
-        help="Before the fit, drop the planes that are bright (mean above "
-        "3x the median plane) and have one dominant bright region (99th "
-        "percentile of the background map above 3x its median), so the "
-        "flatfield does not learn a bright tissue region.  Off by default; "
-        "only with --method fit.",
+        help="When the pre-fit check finds concentrated signal, drop the "
+        "planes that are bright (mean above 3x the median plane) and have "
+        "one dominant bright region (99th percentile of the background map "
+        "above 3x its median) before the fit, so the flatfield does not "
+        "learn a bright tissue region.  Healthy channels keep every plane.  "
+        "Off by default; only with --method fit.",
     )
     parser.add_argument(
         "--basic-config",

@@ -300,9 +300,31 @@ class TestPrefitChecks(unittest.TestCase):
         slices[:2, 2:5, 2:5] = 1e5
         checks = self._checks(None, np.full((8, 8), 105.0), slices)
         self.assertGreater(checks["plane_concentration"]["top_share"], 0.45)
+        self.assertLess(checks["concentrated_fraction"], 0.10)
+        self.assertTrue(checks["concentrated_signal"])
         self.assertEqual(checks["bright_planes"], 2)
         self.assertEqual(checks["concentrated_share_of_bright"], 1.0)
         self.assertIn("--drop-concentrated-planes", checks["warnings"][-1])
+
+    def test_many_concentrated_planes(self):
+        """A third of the planes affected: the top-plane share stays low."""
+        slices = np.full((40, 8, 8), 150.0, dtype=np.float32)
+        slices[:12, 2:5, 2:5] = 1e4
+        checks = self._checks(None, np.full((8, 8), 105.0), slices)
+        self.assertLess(checks["plane_concentration"]["top_share"], 0.45)
+        self.assertEqual(checks["concentrated_planes"], 12)
+        self.assertAlmostEqual(checks["concentrated_fraction"], 0.3)
+        self.assertTrue(checks["concentrated_signal"])
+        self.assertIn("concentrated signal", checks["warnings"][-1])
+
+    def test_bright_planes_with_diffuse_tissue(self):
+        """Bright everywhere is not concentrated: nothing to warn about."""
+        slices = np.full((40, 8, 8), 150.0, dtype=np.float32)
+        slices[:12] = 1500.0
+        checks = self._checks(None, np.full((8, 8), 105.0), slices)
+        self.assertEqual(checks["concentrated_planes"], 0)
+        self.assertFalse(checks["concentrated_signal"])
+        self.assertEqual(checks["warnings"], [])
 
     def test_no_bright_planes(self):
         """The share of concentrated bright planes is then zero."""
@@ -873,10 +895,13 @@ class TestEstimateDataset(unittest.TestCase):
         self.assertFalse(checks["per_pixel_darkfield"])
         self.assertIn("top_share", checks["plane_concentration"])
         self.assertEqual(checks["warnings"], [])
-        self.assertEqual(sidecar["plane_filter"], {"enabled": False})
+        self.assertFalse(checks["concentrated_signal"])
+        self.assertEqual(
+            sidecar["plane_filter"], {"enabled": False, "applied": False}
+        )
 
     def test_the_plane_filter_drops_the_concentrated_plane(self):
-        """Only when asked for, and the record says what went."""
+        """Asked for, and the check found concentrated signal."""
         with tempfile.TemporaryDirectory() as tmp:
             sidecar = self._run(
                 tmp, stack=_concentrated_stack(), drop_concentrated_planes=True
@@ -884,7 +909,9 @@ class TestEstimateDataset(unittest.TestCase):
             manifest = json.loads(
                 (Path(tmp) / "metadata" / "tiles_ch_405.json").read_text()
             )
+        self.assertTrue(sidecar["checks"]["concentrated_signal"])
         self.assertTrue(sidecar["plane_filter"]["enabled"])
+        self.assertTrue(sidecar["plane_filter"]["applied"])
         self.assertEqual(sidecar["plane_filter"]["n_dropped"], 1)
         self.assertEqual(
             sidecar["plane_filter"]["dropped_per_tile"], {TILE_NAMES[0]: 1}
@@ -893,11 +920,32 @@ class TestEstimateDataset(unittest.TestCase):
         self.assertEqual(manifest[0]["z_indices"], [0])
 
     def test_without_the_filter_the_concentrated_plane_is_fitted(self):
-        """The default keeps every plane."""
+        """The check warns, but the default keeps every plane."""
         with tempfile.TemporaryDirectory() as tmp:
             sidecar = self._run(tmp, stack=_concentrated_stack())
+        self.assertTrue(sidecar["checks"]["concentrated_signal"])
+        self.assertTrue(
+            any(
+                "concentrated signal" in warning
+                for warning in sidecar["checks"]["warnings"]
+            )
+        )
         self.assertEqual(sidecar["n_fit_images"], 8)
-        self.assertEqual(sidecar["plane_filter"], {"enabled": False})
+        self.assertEqual(
+            sidecar["plane_filter"], {"enabled": False, "applied": False}
+        )
+
+    def test_the_filter_keeps_every_plane_of_a_healthy_stack(self):
+        """On, but nothing to drop: the check found no concentrated signal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._run(tmp, drop_concentrated_planes=True)
+        self.assertFalse(sidecar["checks"]["concentrated_signal"])
+        self.assertEqual(sidecar["n_fit_images"], 8)
+        self.assertTrue(sidecar["plane_filter"]["enabled"])
+        self.assertFalse(sidecar["plane_filter"]["applied"])
+        self.assertIn(
+            "no concentrated signal", sidecar["plane_filter"]["reason"]
+        )
 
     def test_the_figures_show_the_scaled_flatfield(self):
         """They should show what an apply step will actually do."""
