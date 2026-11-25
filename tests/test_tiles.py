@@ -768,3 +768,25 @@ class TestDropConcentratedPlanes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDefaultLabel(unittest.TestCase):
+    """Deriving the output name from the channel folder."""
+
+    def test_uses_the_last_segment_of_an_s3_path(self):
+        """The folder names the channel."""
+        self.assertEqual(
+            tiles.default_label("s3://bucket/DS/SPIM/ch_405"), "ch_405"
+        )
+
+    def test_ignores_a_trailing_slash(self):
+        """Paths get pasted with and without one."""
+        self.assertEqual(tiles.default_label("/data/SPIM/ch_488/"), "ch_488")
+
+    def test_replaces_filesystem_unsafe_characters(self):
+        """The label becomes part of a filename."""
+        self.assertEqual(tiles.default_label("/data/ch 488 (v2)"), "ch_488_v2")
+
+    def test_falls_back_when_there_is_no_segment(self):
+        """A bare scheme has nothing to name the run after."""
+        self.assertEqual(tiles.default_label("s3://"), "flatfield")

@@ -14,6 +14,7 @@ import logging
 import math
 import multiprocessing
 import time
+import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import shared_memory
 from typing import Any, NamedTuple
@@ -223,9 +224,9 @@ def _eval_basic_params(
         basic = BaSiC(**{**config, **params})
         basic.fit(images)
         return float(score_fit(basic, images, val_range)), params, None
-    except Exception:  # noqa: BLE001 - reported to the parent
-        import traceback
-
+    except Exception:
+        # Deliberately broad: this runs in a worker process, so any
+        # failure is returned to the parent, which logs and reports it.
         return float("inf"), params, traceback.format_exc()
     finally:
         # Always close the shared memory handle

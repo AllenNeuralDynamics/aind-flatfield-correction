@@ -56,9 +56,9 @@ from aind_flatfield_correction.core.basicpy.config import (
     OVER_SUBTRACTED_TOLERANCE,
     OVER_SUBTRACTED_WARN,
 )
-from aind_flatfield_correction.core.basicpy.estimate import default_label
 from aind_flatfield_correction.core.basicpy.tiles import (
     FULL_RESOLUTION_LEVEL,
+    default_label,
     list_tiles,
     open_tile,
 )

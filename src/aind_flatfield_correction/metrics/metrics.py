@@ -26,7 +26,7 @@ def cv(arr: np.ndarray) -> float:
     return float(np.nanstd(arr) / mean * 100) if mean else float("nan")
 
 
-def masked_profile(mosaic, axis):
+def masked_profile(mosaic: np.ndarray, axis: int) -> np.ndarray:
     """
     Mean along ``axis`` over occupied pixels only.
 

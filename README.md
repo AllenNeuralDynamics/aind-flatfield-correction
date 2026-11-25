@@ -24,10 +24,10 @@ This is the result after applying flatfield to the tiles of a proteomics dataset
 ![Example Flatfield](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/flatfield_corrected.png?raw=true)
 ![Example Flatfield Distribution](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/plot_distribution.png?raw=true)
 
-In very low illumination datasets and lower wavelenght channels, we can even detect the difference in the intensity gains of the camera chips.
-![Two Difference Gain](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/two_gain_difference.png?raw=true)
-
-> **Note:** Technically speaking, we don't want to use the same darkfield for each side of the intensity gain, but this is good enough as an approximation and scientists as happy with the results.
+Two kinds of channel need extra care, and each has its own section below:
+[dim channels](#building-a-darkfield-for-dim-channels), where the darkfield decides the
+flatfield, and [channels with bright, localized regions](#bright-localized-regions), where
+BaSiC can learn the tissue instead of the optics.
 
 ## Installation
 
@@ -57,7 +57,7 @@ tile of the same channel. Nothing is inferred from tile names, so to estimate se
 channels you run the command once per channel folder.
 
 ```bash
-python -m aind_flatfield_correction.core.basicpy.estimate \
+aind-flatfield-estimate \
     s3://aind-open-data/HCR_800792_2026-03-25_13-00-00/SPIM/ch_405 \
     --pyramid-level 3 \
     --darkfield-value 90 \
@@ -69,12 +69,22 @@ If the tiles for several channels sit in one flat folder, select a subset with a
 expression and name the run yourself:
 
 ```bash
-python -m aind_flatfield_correction.core.basicpy.estimate <base_path> \
+aind-flatfield-estimate <base_path> \
     --tile-pattern '_ch_405\.ome\.zarr$' \
     --output-name ch405
 ```
 
 Local paths work the same way as `s3://` ones.
+
+If the run warns that the darkfield matters or that the channel is dim, build a darkfield
+from the data first (see [Building a darkfield for dim channels](#building-a-darkfield-for-dim-channels))
+and pass it with `--darkfield-image`. If it warns about concentrated signal, see
+[Bright, localized regions](#bright-localized-regions).
+
+`aind-flatfield-estimate` and `aind-flatfield-darkmap` are installed with the package.
+Without installing the scripts, run the modules instead:
+`python -m aind_flatfield_correction.core.basicpy.cli` and
+`python -m aind_flatfield_correction.core.basicpy.darkmap`.
 
 ## What it produces
 
@@ -124,7 +134,7 @@ Two files sit alongside it in `metadata/`:
 - **`estimation.log`** — every record the run emitted, including per-candidate entropies
   and worker tracebacks that otherwise exist only on the console. Attached to the root
   logger, so jax, dask and botocore warnings land there too. It inherits whatever logging
-  configuration is already in place rather than imposing its own, this is useful if using personalized logging packages, such as ![log-schema](https://pypi.org/project/log-schema/).
+  configuration is already in place rather than imposing its own, this is useful if using personalized logging packages, such as [log-schema](https://pypi.org/project/log-schema/).
 - **`tiles_<name>.json`** — per tile: its name, probed `(Z, H, W)`, the Z indices actually
   loaded, the mean of those planes, and whether it was padded. A dead tile shows up as a
   mean near zero, and a tile smaller than the rest is flagged rather than silently
@@ -231,14 +241,27 @@ configuration you supplied.
 On dim channels the darkfield decides the flatfield (step 3 above warns "the darkfield
 matters" or "dim channel"). A scalar darkfield then leaves the camera pattern — the
 sensor halves and the row stripes — in the flatfield. Recorded dark frames are the best
-darkfield. Without them, `darkmap` builds one from the planes with the least light:
+darkfield. Without them, `darkmap` builds one from the planes with the least light.
+
+The pre-fit check compares how far a per-pixel darkfield is from a single value with the
+signal above it. On the HCR channels below the difference is larger than the signal
+itself, so the darkfield, not the optics, decides the flatfield; on SmartSPIM it is 1–2%:
+
+![Pre-fit dark error relative to the signal](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/prefit_dark_error.png?raw=true)
+
+On an HCR 405 nm channel, a scalar darkfield of 90 leaves the two sensor halves and the row
+stripes in the flatfield (largest boost 352×), and the correction adds a seam and stripes.
+A darkfield built by `darkmap` holds that pattern instead, and the flatfield is the smooth
+vignetting (largest boost 1.4×):
+
+![Scalar darkfield against a darkfield built from the darkest tiles](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/darkmap_vs_scalar_dark.png?raw=true)
 
 ```bash
-python -m aind_flatfield_correction.core.basicpy.darkmap \
+aind-flatfield-darkmap \
     s3://bucket/dataset/SPIM --tile-pattern '_ch_488\.ome\.zarr$' \
     --output-name ch_488 --output-folder ./darkmaps
 
-python -m aind_flatfield_correction.core.basicpy.estimate \
+aind-flatfield-estimate \
     s3://bucket/dataset/SPIM --tile-pattern '_ch_488\.ome\.zarr$' \
     --darkfield-image ./darkmaps/darkfield_ch_488.npy --output-folder ./flats
 ```
@@ -270,6 +293,56 @@ On that HCR channel, a darkfield from 6 fixed tiles was too high for 63% of the 
 | `darkfield_<name>.png` | A preview |
 | `darkfield_<name>.json` | Tiles and planes used, the darkest-plane level of every tile, the two checks and their warnings, the darkfield's statistics, provenance |
 | `metadata/darkmap.log` | The run's log |
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `base_path` | — | Folder holding the tiles; accepts `s3://` |
+| `--tile-pattern` | all entries | Regex selecting which tiles inside the folder to use |
+| `--output-name` | last path segment | Names the outputs |
+| `--pyramid-level` | `3` | Coarse level used to find the darkest planes and tiles |
+| `--n-tiles` | `12` | How many of the darkest tiles the darkfield is built from |
+| `--output-folder` | `darkfield_estimation` | Where the products are written |
+
+## Bright, localized regions
+
+BaSiC sorts each pixel's values across the fitting images and expects the brightest of
+them to be rare. Scattered bright cells are rare at any one pixel and BaSiC ignores them.
+A large bright region, such as an injection site or a dense structure, that sits at the
+same place in many planes is not rare there, so BaSiC fits it into the flatfield. Dividing
+by that flatfield then brightens everything outside the region.
+
+On synthetic data with a known flatfield, tissue spread evenly is learned exactly. One
+bright region per image produces a flatfield with no relation to the true one (correlation
+0.16, largest boost 183×). Dropping the planes with a concentrated region recovers the
+true flatfield:
+
+![BaSiC learning a bright region on synthetic data](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/bright_region_synthetic.png?raw=true)
+
+The pre-fit check (step 3 of [How it works](#how-it-works)) detects this case, and
+`--drop-concentrated-planes` removes the affected planes before the fit (step 4). A plane
+is dropped only when it is both bright (mean above 3× the median plane) and has one
+dominant bright region; bright planes with tissue spread across the view are kept,
+because they are the most informative ones:
+
+```bash
+aind-flatfield-estimate <base_path> --drop-concentrated-planes
+```
+
+On a SmartSPIM 561 nm channel, 405 of 1988 planes were dropped from 4 of 14 tiles, every
+tile kept planes, and the brightest planes' share of the fit fell from 0.60 to 0.28 (healthy
+channels measure 0.14–0.33):
+
+![Planes dropped by the filter](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/bright_region_dropped_planes.png?raw=true)
+
+Without the filter, the flatfield dips where the bright regions were, and the correction
+raises those parts of the tile from 2760 to 17940 counts. With it, the corrected plane
+keeps the raw range:
+
+![A SmartSPIM tile corrected with and without the filter](https://github.com/AllenNeuralDynamics/aind-flatfield-correction/blob/main/imgs/bright_region_filter_smartspim.png?raw=true)
+
+The flag is off by default and works only with `--method fit`. When the check finds no
+concentrated signal it keeps every plane, so it is safe to leave on for a whole dataset.
+The sidecar's `plane_filter` block records what was dropped per tile.
 
 ## Options
 
@@ -387,8 +460,9 @@ ok, stats, reasons = report_flatfield(flatfield)
 
 | Module | Responsibility |
 |---|---|
-| `core.basicpy.estimate` | CLI, pre-fit checks and per-run orchestration |
-| `core.basicpy.tiles` | Tile discovery, plane loading, darkfield handling, plane scores and the plane filter |
+| `core.basicpy.cli` | Command-line entry point (`aind-flatfield-estimate`) |
+| `core.basicpy.estimate` | Pre-fit checks and per-run orchestration |
+| `core.basicpy.tiles` | Tile discovery and output naming, plane loading, darkfield handling, plane scores and the plane filter |
 | `core.basicpy.darkmap` | Darkfield from the darkest planes of the darkest tiles, and its CLI |
 | `core.basicpy.search` | The entropy objective and the parameter search |
 | `core.basicpy.fit` | Joint and per-Z fitting, plausibility guard |

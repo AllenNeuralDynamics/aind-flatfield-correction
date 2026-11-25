@@ -14,6 +14,7 @@ from typing import NamedTuple, Optional
 
 import boto3
 import numpy as np
+import zarr.errors
 from aind_large_scale_prediction.io import OMEZarrReader
 from botocore import UNSIGNED
 from botocore.client import Config
@@ -33,6 +34,17 @@ logger = logging.getLogger(__name__)
 # resolution, so the first one is the full-resolution level.
 FULL_RESOLUTION_LEVEL = "0"
 ZARR_VERSIONS = ("2.0", "3.0")
+# What the tile reader raises for a missing, unreadable or wrong-version
+# tile: tensorstore and zarr raise ValueError subclasses, a wrong zarr
+# version surfaces as a TypeError, missing metadata as a KeyError or a
+# zarr MetadataError, and a missing or forbidden path as an OSError.
+TILE_OPEN_ERRORS = (
+    OSError,
+    KeyError,
+    TypeError,
+    ValueError,
+    zarr.errors.MetadataError,
+)
 
 
 class TileRecord(NamedTuple):
@@ -122,6 +134,33 @@ def _list_tile_names_local(base_path: str) -> list[str]:
     if not root.is_dir():
         raise FileNotFoundError(f"base_path is not a directory: {base_path}")
     return sorted(entry.name for entry in root.iterdir())
+
+
+def default_label(base_path: str) -> str:
+    """
+    Derive an output name from the channel folder's own name.
+
+    Parameters
+    ----------
+    base_path : str
+        Channel folder, ``s3://`` or local.
+
+    Returns
+    -------
+    str
+        The last non-empty path segment, with anything but letters,
+        digits, dot, dash and underscore replaced by an underscore.
+        Falls back to ``"flatfield"`` for a path with no usable
+        segment.
+    """
+    segments = [
+        segment
+        for segment in base_path.replace("s3://", "").split("/")
+        if segment
+    ]
+    if not segments:
+        return "flatfield"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", segments[-1]).strip("_")
 
 
 def list_tiles(
@@ -215,7 +254,7 @@ def open_tile(
                     zarr_version=candidate,
                 )
                 break
-            except Exception as error:  # noqa: BLE001
+            except TILE_OPEN_ERRORS as error:
                 failures.append(f"zarr {candidate}: {error}")
                 logger.debug(
                     "  tile %s did not open as zarr %s: %s",
@@ -241,7 +280,7 @@ def open_tile(
                 multiscale=str(level),
                 zarr_version=zarr_version,
             )
-        except Exception as error:  # noqa: BLE001
+        except TILE_OPEN_ERRORS as error:
             logger.error("Failed to open tile %s at %s: %s", name, uri, error)
             raise ValueError(
                 f"Failed to open tile {name} as zarr {zarr_version}"
@@ -444,9 +483,11 @@ def load_darkfield(
 
     Raises
     ------
-    Exception
-        Whatever the reader raised, after logging the path; a darkfield
-        that cannot be read must not silently become a no-op.
+    OSError or ValueError
+        Whatever the reader raised (tifffile's ``TiffFileError`` and a
+        file ``np.load`` cannot parse are ``ValueError``), after logging
+        the path; a darkfield that cannot be read must not silently
+        become a no-op.
     """
     if darkfield_image:
         try:
@@ -458,9 +499,9 @@ def load_darkfield(
                 # Defaults to numpy array
                 # Errors out if the file is not a valid numpy array
                 dark = np.load(darkfield_image).astype(np.float32)
-        except Exception as e:
+        except (OSError, ValueError) as error:
             logger.error(
-                "Failed to load darkfield image %s: %s", darkfield_image, e
+                "Failed to load darkfield image %s: %s", darkfield_image, error
             )
             raise
 

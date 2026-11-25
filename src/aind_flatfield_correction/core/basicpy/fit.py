@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import shared_memory
 from typing import Any
@@ -47,13 +48,14 @@ def validate_basic_config(config: dict[str, Any]) -> None:
 
     Raises
     ------
-    Exception
-        Whatever BaSiC raises for the offending key, after logging the
+    TypeError or ValueError
+        Whatever BaSiC raises for the offending key (pydantic's
+        ``ValidationError`` is a ``ValueError``), after logging the
         configuration that was rejected.
     """
     try:
         BaSiC(**config)
-    except Exception:
+    except (TypeError, ValueError):
         logger.error("BaSiC rejected the configuration %s", config)
         raise
 
@@ -102,9 +104,9 @@ def _fit_one_z(
         basic.fit(np.ascontiguousarray(stacks[zi]))
         flat = np.asarray(basic.flatfield, dtype=np.float32)
         return int(zi), flat, None
-    except Exception:  # noqa: BLE001 - reported to the parent
-        import traceback
-
+    except Exception:
+        # Deliberately broad: this runs in a worker process, so any
+        # failure is returned to the parent, which logs and reports it.
         return int(zi), None, traceback.format_exc()
     finally:
         shm.close()
