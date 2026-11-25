@@ -21,8 +21,9 @@ is left:
 * the spread of the darkest-plane level across tiles: a camera dark is the
   same in every tile, so a large spread means the dark planes contain
   light;
-* the share of tiles whose darkest plane is below the darkfield's mean:
-  for those tiles the darkfield is certainly too high.
+* the share of tiles whose darkest plane is below the darkfield's mean
+  (by more than a small tolerance): for those tiles the darkfield is
+  certainly too high.
 
 Usage::
 
@@ -52,6 +53,7 @@ from aind_flatfield_correction.core.basicpy.config import (
     DARKMAP_N_TILES,
     LEVEL_SUBSAMPLE,
     LIGHT_SPREAD_WARN,
+    OVER_SUBTRACTED_TOLERANCE,
     OVER_SUBTRACTED_WARN,
 )
 from aind_flatfield_correction.core.basicpy.estimate import default_label
@@ -252,7 +254,8 @@ def build_darkmap(
 
     map_mean = float(darkmap.mean())
     spread = light_spread(darkest_all)
-    over_subtracted = float(np.mean(darkest_all < map_mean))
+    excess = map_mean - darkest_all
+    over_subtracted = float(np.mean(excess > OVER_SUBTRACTED_TOLERANCE))
     report: dict[str, Any] = {
         "n_tiles_measured": len(tiles),
         "n_tiles_used": len(chosen),

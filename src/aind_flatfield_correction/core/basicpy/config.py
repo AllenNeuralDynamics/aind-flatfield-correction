@@ -113,10 +113,13 @@ DARKMAP_N_TILES = 12
 # every tile.  HCR channels with a camera-only dark: 0.7-1.4 counts; a
 # channel whose dark planes carried scattered light: 8.3 counts.
 LIGHT_SPREAD_WARN = 3.0
-# Share of the tiles whose darkest plane is below the darkfield's mean,
-# above which the darkfield is too high for many tiles and removes real
-# signal there.  6 fixed tiles: 63%; the 12 darkest tiles: 3%.
+# Share of the tiles whose darkest plane is below the darkfield's mean by
+# more than OVER_SUBTRACTED_TOLERANCE counts, above which the darkfield is
+# too high for many tiles and removes real signal there.  6 fixed tiles:
+# 63%; the 12 darkest tiles: 3%.  The tolerance keeps a camera-only dark,
+# whose darkest planes all sit within noise of it, from being counted.
 OVER_SUBTRACTED_WARN = 0.10
+OVER_SUBTRACTED_TOLERANCE = 0.05
 # Pixel step used to measure the mean of every plane when ranking planes.
 LEVEL_SUBSAMPLE = 4
 

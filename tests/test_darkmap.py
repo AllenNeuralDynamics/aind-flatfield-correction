@@ -239,6 +239,12 @@ class TestBuildDarkmap(unittest.TestCase):
             any("removes real signal" in w for w in report["warnings"])
         )
 
+    def test_tiles_within_the_tolerance_are_not_counted(self):
+        """Darkest planes 0.03 counts under the map are noise, not light."""
+        darkest = [(1, 90.47), (2, 90.5), (0, 90.5), (3, 90.47), (4, 90.5)]
+        _, report = self._build(darkest)
+        self.assertEqual(report["over_subtracted_tiles"], 0.0)
+
     def test_a_camera_dark_raises_no_warning(self):
         """Every tile's darkest plane at the same 90.5 counts."""
         darkest = [(1, 90.5), (2, 90.5), (0, 90.5), (3, 90.5), (4, 90.5)]

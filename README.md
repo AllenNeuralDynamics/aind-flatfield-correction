@@ -257,7 +257,8 @@ Using the darkest tiles keeps that light low, and the sidecar reports two checks
   light (HCR: 0.7–1.4 counts for camera-only darks, 8.3 for a channel whose dark planes
   carried scattered light).
 - `over_subtracted_tiles` — the share of tiles whose darkest plane is below the darkfield's
-  mean, where the darkfield is certainly too high; above 10% it warns.
+  mean by more than 0.05 counts, where the darkfield is certainly too high; above 10% it
+  warns.
 
 On that HCR channel, a darkfield from 6 fixed tiles was too high for 63% of the tiles; the
 12 darkest tiles gave 3%, and the flatfield's signal CV fell from 3.2% to 1.35% (6, 12 or
